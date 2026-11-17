@@ -1,0 +1,1238 @@
+diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
+index 1e713c07..a3c35f8c 100644
+--- a/ModernGekko/CMakeLists.txt
++++ b/ModernGekko/CMakeLists.txt
+@@ -56,6 +56,16 @@ option(MODERNGEKKO_ENABLE_DYNAMIC_MODULES
+ 
+ option(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME
+        "Build the RecompCore/Dolphin production chassis" ON)
++option(MODERNGEKKO_PS5 "Build the RingOut direct-display PS5 host" OFF)
++if(MODERNGEKKO_PS5)
++    set(RINGOUT_PS5_MODULE "" CACHE FILEPATH "Static recompiled game archive")
++    set(RINGOUT_PS5_RADV_LIBRARIES "" CACHE STRING "PS5 RADV archives and link dependencies")
++    if(NOT MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME OR
++       NOT IS_ABSOLUTE "${RINGOUT_PS5_MODULE}" OR NOT RINGOUT_PS5_RADV_LIBRARIES)
++        message(FATAL_ERROR "RingOut PS5 requires the Dolphin runtime, RINGOUT_PS5_MODULE and RINGOUT_PS5_RADV_LIBRARIES")
++    endif()
++    find_package(SDL3 3.2 CONFIG REQUIRED)
++endif()
+ option(MODERNGEKKO_ENABLE_DOLPHIN_TESTS
+        "Build the imported Dolphin unit-test targets" OFF)
+ # dolphin-tool reads the disc formats DolRecomp's own extractor does not (RVZ,
+@@ -116,7 +126,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     endif()
+     set(ENABLE_HWDB OFF CACHE BOOL "" FORCE)
+     set(ENABLE_EVDEV OFF CACHE BOOL "" FORCE)
+-    set(ENABLE_WAYLAND ON CACHE BOOL "" FORCE)
++    if(MODERNGEKKO_PS5)
++        set(ENABLE_WAYLAND OFF CACHE BOOL "" FORCE)
++        set(ENABLE_X11 OFF CACHE BOOL "" FORCE)
++        set(ENABLE_SDL ON CACHE BOOL "" FORCE)
++        set(USE_SYSTEM_SDL3 ON CACHE BOOL "" FORCE)
++    else()
++        set(ENABLE_WAYLAND ON CACHE BOOL "" FORCE)
++    endif()
+     set(ENABLE_EGL OFF CACHE BOOL "" FORCE)
+     # Vendored by default, as every other dependency here is: the shipped
+     # builds must not vary with whatever SDL a build machine happens to have.
+@@ -350,6 +367,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
+     endif()
+     target_link_libraries(moderngekko PRIVATE core uicommon)
++    if(MODERNGEKKO_PS5)
++        target_sources(moderngekko PRIVATE ps5/platform.cpp)
++        target_compile_definitions(moderngekko PRIVATE MODERNGEKKO_PS5=1)
++        target_compile_definitions(videovulkan PRIVATE RINGOUT_LINKED_RADV=1)
++        target_link_libraries(videovulkan PRIVATE ${RINGOUT_PS5_RADV_LIBRARIES})
++        add_executable(ringout_ps5 ps5/main.cpp ps5/native_startup_log.c ps5/posix_filesystem.c)
++        target_link_libraries(ringout_ps5 PRIVATE ModernGekko::Runtime "${RINGOUT_PS5_MODULE}")
++    endif()
+     if(TARGET PkgConfig::X11)
+         target_sources(moderngekko PRIVATE
+             vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
+diff --git a/ModernGekko/ps5/main.cpp b/ModernGekko/ps5/main.cpp
+new file mode 100644
+index 00000000..b0b4f2f4
+--- /dev/null
++++ b/ModernGekko/ps5/main.cpp
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "moderngekko/runtime.hpp"
++#include "native_startup.h"
++
++extern "C" {
++#include "startup_log.h"
++const ModernGekkoModuleDesc* staticrecomp_get_module(void);
++}
++
++#include <exception>
++#include <filesystem>
++#include <utility>
++
++int main(int argc, char** argv)
++{
++    ringout_native_stage("main entered\n");
++    ringout_native_value("argc ", static_cast<unsigned>(argc));
++    if ((argc != 1 && argc != 3) || !argv || !argv[0] ||
++        (argc == 3 && (!argv[1] || !argv[2])))
++    {
++        ringout_native_stage("Invalid launch arguments\n");
++        std::fputs("Usage: RingOut [<game-directory> <user-directory>]\n", stderr);
++        return 2;
++    }
++    RingOutStartupLog log{};
++    if (ringout_log_open(&log, nullptr) != 0)
++        std::fputs("RingOut: could not open startup log\n", stderr);
++
++    int status = 1;
++    try
++    {
++        // Launchers may pass only eboot.bin. Resolving it via current_path invoked
++        // libc's raw pathconf syscall before any diagnostics. Use the known app
++        // contract in that case; absolute executable paths remain portable.
++        const std::filesystem::path executable(argv[0]);
++        const auto app_directory = executable.is_absolute() ? executable.parent_path() :
++                                                              std::filesystem::path(RINGOUT_APP_ROOT);
++        ringout_log_write(&log, "App directory ");
++        ringout_log_write(&log, app_directory.string().c_str());
++        ringout_log_write(&log, "\n");
++        const std::filesystem::path game_directory = argc == 3 ? argv[1] : app_directory / "game";
++        const std::filesystem::path user_directory = argc == 3 ? argv[2] : app_directory / "user";
++        std::error_code error;
++        std::filesystem::create_directories(user_directory, error);
++        if (error)
++        {
++            ringout_log_write(&log, "Could not create user directory ");
++            ringout_log_write(&log, error.message().c_str());
++            return 2;
++        }
++        ringout_log_write(&log, "Creating RingOut runtime\n");
++        moderngekko::RuntimeConfig config;
++        config.game_root = game_directory;
++        config.user_directory = user_directory;
++        ringout_log_write(&log, "Attaching recompiled game module\n");
++        config.module = moderngekko::ModuleSource::AttachedDescriptor(staticrecomp_get_module());
++        config.graphics.backend = "Vulkan";
++        config.graphics.internal_resolution_scale = 1;
++        config.show_fps_in_title = false;
++        ringout_log_write(&log, "Creating runtime; requested graphics backend Vulkan\n");
++        auto result = moderngekko::Runtime::Create(std::move(config));
++        if (result)
++        {
++            ringout_log_write(&log, "Starting game\n");
++            const auto run = result.runtime->Run();
++            if (run.error)
++                ringout_log_write(&log, run.error->message.c_str());
++            else if (run.reason == moderngekko::RuntimeExitReason::Stopped)
++                status = 0;
++        }
++        else if (result.error)
++        {
++            ringout_log_write(&log, result.error->message.c_str());
++        }
++    }
++    catch (const std::exception& error)
++    {
++        ringout_log_write(&log, error.what());
++    }
++
++    ringout_log_write(&log, status == 0 ? "\nRuntime stopped\n" : "\nRuntime failed\n");
++    return ringout_log_close(&log) == 0 ? status : 1;
++}
+diff --git a/ModernGekko/ps5/startup_log.c b/ModernGekko/ps5/startup_log.c
+new file mode 100644
+index 00000000..60053477
+--- /dev/null
++++ b/ModernGekko/ps5/startup_log.c
+@@ -0,0 +1,75 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "startup_log.h"
++
++#include <inttypes.h>
++#include <stdint.h>
++#include <string.h>
++
++enum { SlotCount = 6, ByteLimit = 64 * 1024 };
++
++int ringout_log_open(RingOutStartupLog* log, const char* directory)
++{
++    char path[1024];
++    uint64_t newest = 0;
++    unsigned next = 0;
++    *log = (RingOutStartupLog){0};
++
++    for (unsigned slot = 0; slot < SlotCount; ++slot)
++    {
++        int length = snprintf(path, sizeof(path), "%s/startup-%u.log", directory, slot);
++        if (length < 0 || (size_t)length >= sizeof(path))
++            return -1;
++
++        FILE* previous = fopen(path, "rb");
++        if (previous)
++        {
++            uint64_t generation = 0;
++            if (fscanf(previous, "run %" SCNu64, &generation) == 1 && generation > newest)
++            {
++                newest = generation;
++                next = (slot + 1) % SlotCount;
++            }
++            fclose(previous);
++        }
++    }
++
++    if (newest == UINT64_MAX)
++        return -1;
++
++    snprintf(path, sizeof(path), "%s/startup-%u.log", directory, next);
++    log->file = fopen(path, "wb");
++    if (!log->file)
++        return -1;
++
++    int length = fprintf(log->file, "run %" PRIu64 "\n", newest + 1);
++    if (length < 0 || fflush(log->file) != 0)
++    {
++        ringout_log_close(log);
++        return -1;
++    }
++
++    log->remaining = ByteLimit - (size_t)length;
++    return 0;
++}
++
++int ringout_log_write(RingOutStartupLog* log, const char* message)
++{
++    if (!log->file)
++        return -1;
++
++    size_t length = strlen(message);
++    if (length > log->remaining)
++        length = log->remaining;
++
++    size_t written = fwrite(message, 1, length, log->file);
++    log->remaining -= written;
++    int flush_status = fflush(log->file);
++    return written == length && flush_status == 0 ? 0 : -1;
++}
++
++int ringout_log_close(RingOutStartupLog* log)
++{
++    int status = log->file ? fclose(log->file) : 0;
++    *log = (RingOutStartupLog){0};
++    return status;
++}
+diff --git a/ModernGekko/ps5/startup_log.h b/ModernGekko/ps5/startup_log.h
+new file mode 100644
+index 00000000..f1a2c391
+--- /dev/null
++++ b/ModernGekko/ps5/startup_log.h
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++
++#include <stddef.h>
++#include <stdio.h>
++
++// One writer per app instance. The caller supplies a private, writable log directory.
++typedef struct RingOutStartupLog
++{
++    FILE* file;
++    size_t remaining;
++} RingOutStartupLog;
++
++int ringout_log_open(RingOutStartupLog* log, const char* directory);
++int ringout_log_write(RingOutStartupLog* log, const char* message);
++int ringout_log_close(RingOutStartupLog* log);
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index b85977cc..3953c18b 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -3,6 +3,11 @@
+ #include "AudioCommon/AudioCommon.h"
+ #include "Common/Config/Config.h"
+ #include "Common/HookableEvent.h"
++#ifdef MODERNGEKKO_PS5
++#include "Common/FileUtil.h"
++#include "Common/IniFile.h"
++#include "../../ps5/native_startup.h"
++#endif
+ #include "VideoCommon/VideoBackendBase.h"
+ 
+ #include "Common/MsgHandler.h"
+@@ -205,6 +210,42 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
+ }
+ 
+ namespace {
++#ifdef MODERNGEKKO_PS5
++void RuntimeStage(const char *message) { ringout_native_stage(message); }
++#else
++void RuntimeStage(const char *) {}
++#endif
++#ifdef MODERNGEKKO_PS5
++void ConfigureDefaultPS5Pad() {
++  auto *const config = Pad::GetConfig();
++  if (!config || config->GetControllerCount() == 0)
++    return;
++  auto *const pad = config->GetController(0);
++  Common::IniFile saved;
++  if (saved.Load(File::GetUserPath(D_CONFIG_IDX) + "GCPadNew.ini") &&
++      saved.GetSection(pad->GetName()))
++    return;
++
++  const auto devices = g_controller_interface.GetAllDeviceStrings();
++  const auto device = std::ranges::find_if(
++      devices, [](const std::string &name) { return name.starts_with("SDL/"); });
++  if (device == devices.end())
++    return;
++
++  Common::IniFile profile;
++  if (!profile.Load(File::GetSysDirectory() + "Profiles/GCPad/SDL Gamepad.ini"))
++    return;
++  auto *section = profile.GetSection("Profile");
++  if (!section)
++    return;
++
++  const auto lock = ControllerEmu::EmulatedController::GetStateLock();
++  pad->LoadConfig(section);
++  pad->SetDefaultDevice(*device);
++  pad->UpdateReferences(g_controller_interface);
++}
++#endif
++
+ // A pad profile names its device as a string ("SDL/0/Steam Deck Controller").
+ // That string is not stable: on a Steam Deck the same physical pad enumerates as
+ // "SDL/0/Steam Deck Controller" or "SDL/0/Steam Virtual Gamepad" depending on
+@@ -421,13 +462,17 @@ your game data has been modified and what that does to netplay.
+ }
+ 
+ void InitializeUICommon(const std::filesystem::path &user_directory) {
++  RuntimeStage("runtime: set user directory\n");
+   UICommon::SetUserDirectory(user_directory.string());
+   // Only DolphinQt's main() called this, so running headless/NoGUI left the
+   // user directory without StateSaves/, Screenshots/, Logs/, Maps/ etc. and
+   // anything writing there failed with "failed to create file" -- savestates
+   // in particular.
++  RuntimeStage("runtime: create UI directories\n");
+   UICommon::CreateDirectories();
++  RuntimeStage("runtime: scaffold mod directories\n");
+   ScaffoldModDirectories(user_directory);
++  RuntimeStage("runtime: UICommon init\n");
+   UICommon::Init();
+   // Dolphin's default non-Windows alert handler answers "No" to every
+   // question, and ASSERT's PanicYesNo treats "No" as "don't ignore" ->
+@@ -444,6 +489,9 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
+ std::unique_ptr<Platform> CreateHostPlatform(const RuntimeConfig &config) {
+   if (config.headless)
+     return Platform::CreateHeadlessPlatform();
++#ifdef MODERNGEKKO_PS5
++  return Platform::CreatePS5Platform();
++#endif
+ #ifdef _WIN32
+   return Platform::CreateWin32Platform();
+ #endif
+@@ -949,10 +997,19 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+         RuntimeError{RuntimeErrorCode::AlreadyActive,
+                      "only one ModernGekko runtime may be active per process"}};
+ 
++  RuntimeStage("runtime: game root ");
++#ifdef MODERNGEKKO_PS5
++  RuntimeStage(config.game_root.c_str());
++  RuntimeStage("\nruntime: user directory ");
++  RuntimeStage(config.user_directory.c_str());
++  RuntimeStage("\n");
++#endif
++  RuntimeStage("runtime: inspect game\n");
+   GameInspectResult inspected = InspectGame(config.game_root);
+   if (!inspected)
+     return {{}, RuntimeError{RuntimeErrorCode::InvalidGame, inspected.error}};
+ 
++  RuntimeStage("runtime: resolve module\n");
+   if (auto error = ResolveModuleSource(config, *inspected.metadata))
+     return {{}, std::move(*error)};
+ 
+@@ -971,9 +1028,11 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   // match the disc it came from? Netplay and the MODS tab both read the answer,
+   // and the hash is cached against root.olk's size and mtime so this is only
+   // expensive the first time and after an actual patch.
++  RuntimeStage("runtime: initialize game data\n");
+   RecompGameData::Initialize(impl->config.game_root.string(),
+                              impl->config.user_directory.string());
+ 
++  RuntimeStage("runtime: create and initialize platform\n");
+   impl->platform = CreateHostPlatform(impl->config);
+   if (!impl->platform || !impl->platform->Init()) {
+     if (impl->ui_initialized)
+@@ -983,11 +1042,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+                          "the requested Dolphin host platform is unavailable"}};
+   }
+ 
++  RuntimeStage("runtime: initialize controllers\n");
+   UICommon::InitControllers(impl->platform->GetWindowSystemInfo());
+   impl->controllers_initialized = true;
++#ifdef MODERNGEKKO_PS5
++  ConfigureDefaultPS5Pad();
++#endif
+   RebindPadsToPresentDevices();
+   impl->platform->SetTitle(impl->title);
+ 
++  RuntimeStage("runtime: apply settings\n");
+   ApplyCoreSettings(impl->metadata);
+   ApplyGraphicsSettings(impl->config.graphics, impl->config.headless);
+   ApplyAudioSettings(impl->config.audio, impl->config.headless);
+@@ -995,6 +1059,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+                   impl->config.input.background_input);
+   ApplyModuleSourceToJit(impl->config.module);
+ 
++  RuntimeStage("runtime: creation complete\n");
+   s_runtime_active = true;
+   s_platform = impl->platform.get();
+   s_window_title = impl->title;
+@@ -1021,11 +1086,13 @@ Runtime::~Runtime() {
+ }
+ 
+ RuntimeRunResult Runtime::Run() {
++  RuntimeStage("run: enter\n");
+   if (m_impl->running.exchange(true))
+     return {RuntimeExitReason::BootFailed,
+             RuntimeError{RuntimeErrorCode::InvalidState,
+                          "runtime is already running"}};
+ 
++  RuntimeStage("run: create boot parameters\n");
+   std::unique_ptr<BootParameters> boot =
+       TakeBootParameters(m_impl->metadata.main_dol.string());
+   if (!boot) {
+@@ -1041,6 +1108,7 @@ RuntimeRunResult Runtime::Run() {
+   // The pad plumbing already exists: SI_DeviceGCController calls
+   // HandleMoviePadStatus on every poll, which plays a recorded pad back or
+   // records the live one. Nothing had ever turned it on.
++  RuntimeStage("run: prepare replay state\n");
+   auto& movie = Core::System::GetInstance().GetMovie();
+   // A rebuilt session shares this process's MovieManager, and nothing clears
+   // its mode when a session ends -- Shutdown() empties the buffers and leaves
+@@ -1108,6 +1176,7 @@ RuntimeRunResult Runtime::Run() {
+                  m_impl->config.record_movie.string().c_str());
+   }
+ 
++  RuntimeStage("run: register core state hook\n");
+   m_impl->state_hook =
+       Core::AddOnStateChangedCallback([this](Core::State state) {
+         // Written on the STOPPING edge. Core.cpp's EmuThread holds a ScopeGuard
+@@ -1161,6 +1230,7 @@ RuntimeRunResult Runtime::Run() {
+           m_impl->platform->Stop();
+       });
+   m_impl->reached_running = false;
++  RuntimeStage("run: boot core\n");
+   if (!BootManager::BootCore(Core::System::GetInstance(), std::move(boot),
+                              m_impl->platform->GetWindowSystemInfo())) {
+     m_impl->running = false;
+@@ -1169,18 +1239,23 @@ RuntimeRunResult Runtime::Run() {
+                          "Dolphin could not boot sys/main.dol"}};
+   }
+   m_impl->booted = true;
++  RuntimeStage("run: boot core accepted\n");
+   // Continue-where-you-left-off (menu System > Auto-Resume). Headless runs are
+   // benchmarks/verification; loading a state there would corrupt them.
+   if (!m_impl->config.headless)
+     RecompMenu::ScheduleAutoResumeLoad();
++  RuntimeStage("run: auto-resume scheduled\n");
+   std::jthread title_thread;
+   if (!m_impl->config.headless && m_impl->config.show_fps_in_title)
+     title_thread = StartTitleThread();
++  RuntimeStage("run: enter platform loop\n");
+   m_impl->platform->MainLoop();
++  RuntimeStage("run: platform loop returned\n");
+   title_thread.request_stop();
+   if (title_thread.joinable())
+     title_thread.join();
+   m_impl->platform->SaveWindowGeometry();
++  RuntimeStage("run: stop and shutdown core\n");
+   Core::Stop(Core::System::GetInstance());
+   Core::Shutdown(Core::System::GetInstance());
+   m_impl->booted = false;
+diff --git a/ModernGekko/src/runtime/game.cpp b/ModernGekko/src/runtime/game.cpp
+index fdb3604f..4dcd6b0c 100644
+--- a/ModernGekko/src/runtime/game.cpp
++++ b/ModernGekko/src/runtime/game.cpp
+@@ -145,16 +145,35 @@ std::optional<std::vector<std::uint8_t>> ReadFile(const std::filesystem::path& p
+ 
+ GameInspectResult InspectGame(const std::filesystem::path& input_root)
+ {
++  if (input_root.empty())
++    return {{}, "game root is empty"};
+   std::error_code ec;
++#ifdef MODERNGEKKO_PS5
++  // The launcher supplies an absolute app-contained path. Do not send that
++  // path through libc realpath: a failed canonicalization can yield an empty
++  // result, which is not a usable game root. Keep the supplied path intact so
++  // filesystem lookup, including symlinks, retains its ordinary semantics.
++  if (!input_root.is_absolute())
++    return {{}, "PS5 game root must be absolute: " + input_root.string()};
++  const auto& root = input_root;
++#else
+   const auto root = std::filesystem::weakly_canonical(input_root, ec);
+-  if (ec || !std::filesystem::is_directory(root))
+-    return {{}, "game root is not a readable directory"};
++  if (ec || root.empty())
++    return {{}, "could not resolve game root: " + input_root.string() +
++                    (ec ? ": " + ec.message() : ": empty resolved path")};
++#endif
++  if (!std::filesystem::is_directory(root, ec))
++    return {{}, "game root is not a readable directory: " + root.string() +
++                    (ec ? ": " + ec.message() : "")};
+   const auto dol_path = root / "sys" / "main.dol";
+   const auto boot_path = root / "sys" / "boot.bin";
+-  if (!std::filesystem::is_regular_file(dol_path))
+-    return {{}, "missing sys/main.dol"};
+-  if (!std::filesystem::is_directory(root / "files"))
+-    return {{}, "missing files directory"};
++  if (!std::filesystem::is_regular_file(dol_path, ec))
++    return {{}, "missing or unreadable DOL: " + dol_path.string() +
++                    (ec ? ": " + ec.message() : "")};
++  const auto files_path = root / "files";
++  if (!std::filesystem::is_directory(files_path, ec))
++    return {{}, "missing or unreadable files directory: " + files_path.string() +
++                    (ec ? ": " + ec.message() : "")};
+   const auto boot = ReadFile(boot_path);
+   const auto dol = ReadFile(dol_path);
+   if (!boot || boot->size() < 0x60)
+diff --git a/ModernGekko/tests/game_inspect_test.cpp b/ModernGekko/tests/game_inspect_test.cpp
+index d042cd7e..fa79dad1 100644
+--- a/ModernGekko/tests/game_inspect_test.cpp
++++ b/ModernGekko/tests/game_inspect_test.cpp
+@@ -10,10 +10,25 @@ namespace fs = std::filesystem;
+ 
+ int main()
+ {
++  // Invalid roots must produce an inspection error rather than a filesystem
++  // exception (the native startup failure reported posix_stat on an empty path).
++  const auto empty = moderngekko::InspectGame({});
++  if (empty || empty.error.find("empty") == std::string::npos)
++    return 1;
++#ifdef MODERNGEKKO_PS5
++  const auto relative = moderngekko::InspectGame("relative-game-root");
++  if (relative || relative.error.find("absolute") == std::string::npos)
++    return 1;
++#endif
+   const fs::path root = fs::temp_directory_path() / "moderngekko-game-inspect-test";
+   fs::remove_all(root);
++  if (moderngekko::InspectGame(root))
++    return 1;
+   fs::create_directories(root / "sys");
+   fs::create_directories(root / "files");
++  const auto missing_dol = moderngekko::InspectGame(root);
++  if (missing_dol || missing_dol.error.find("main.dol") == std::string::npos)
++    return 1;
+ 
+   std::array<unsigned char, 0x60> boot{};
+   const char id[] = "TEST01";
+@@ -33,6 +48,12 @@ int main()
+       .write(reinterpret_cast<const char*>(dol.data()), dol.size());
+ 
+   const auto result = moderngekko::InspectGame(root);
++  // A file in place of the required directory also returns a bounded error.
++  fs::remove(root / "files");
++  std::ofstream(root / "files").put('x');
++  const auto wrong_type = moderngekko::InspectGame(root);
++  if (wrong_type || wrong_type.error.find("files directory") == std::string::npos)
++    return 1;
+   fs::remove_all(root);
+   if (!result || result.metadata->disc_id != "TEST01" ||
+       result.metadata->game_name != "Synthetic Test Game" ||
+diff --git a/ModernGekko/vendor/dolphin/CMakeLists.txt b/ModernGekko/vendor/dolphin/CMakeLists.txt
+index 49ae8ae1..f5408963 100644
+--- a/ModernGekko/vendor/dolphin/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/CMakeLists.txt
+@@ -725,7 +725,7 @@ if(ENABLE_CUBEB)
+   add_definitions(-DHAVE_CUBEB)
+ endif()
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT MODERNGEKKO_PS5)
+   dolphin_find_optional_system_library(LibUSB Externals/libusb)
+   add_definitions(-D__LIBUSB__)
+ endif()
+@@ -753,7 +753,7 @@ dolphin_find_optional_system_library(MBEDTLS Externals/mbedtls 2.28)
+ 
+ dolphin_find_optional_system_library(CURL Externals/curl)
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT MODERNGEKKO_PS5)
+   dolphin_find_optional_system_library(HIDAPI Externals/hidapi)
+ endif()
+ 
+@@ -793,7 +793,8 @@ endif()
+ add_subdirectory(Externals/watcher)
+ 
+ # Any other platform or BSD is currently unsupported by cpp-ipc
+-if(WIN32 OR LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "QNX")
++if(NOT MODERNGEKKO_PS5 AND
++   (WIN32 OR LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "QNX"))
+   add_subdirectory(Externals/cpp-ipc)
+   add_definitions(-DHAVE_CPPIPC)
+ endif()
+diff --git a/ModernGekko/vendor/dolphin/Externals/bzip2/bzip2/bzlib.c b/ModernGekko/vendor/dolphin/Externals/bzip2/bzip2/bzlib.c
+index 21786551..70aac11d 100644
+--- a/ModernGekko/vendor/dolphin/Externals/bzip2/bzip2/bzlib.c
++++ b/ModernGekko/vendor/dolphin/Externals/bzip2/bzip2/bzlib.c
+@@ -1408,7 +1408,7 @@ BZFILE * bzopen_or_bzdopen
+       case 's':
+          smallMode = 1; break;
+       default:
+-         if (isdigit((int)(*mode))) {
++         if (*mode >= '0' && *mode <= '9') {
+             blockSize100k = *mode-BZ_HDR_0;
+          }
+       }
+diff --git a/ModernGekko/vendor/dolphin/Externals/cpp-ipc/cpp-ipc/src/CMakeLists.txt b/ModernGekko/vendor/dolphin/Externals/cpp-ipc/cpp-ipc/src/CMakeLists.txt
+index 0d167321..7aed92ad 100755
+--- a/ModernGekko/vendor/dolphin/Externals/cpp-ipc/cpp-ipc/src/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/Externals/cpp-ipc/cpp-ipc/src/CMakeLists.txt
+@@ -78,4 +78,4 @@ write_basic_package_version_file(
+ 	VERSION ${PACKAGE_VERSION}
+ 	COMPATIBILITY AnyNewerVersion
+ )
+-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cppIpcConfigVersion.cmake DESTINATION share/cpp-ipc)
+\ No newline at end of file
++install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cppIpcConfigVersion.cmake DESTINATION share/cpp-ipc)
+diff --git a/ModernGekko/vendor/dolphin/GXRuntime/include/core/types.h b/ModernGekko/vendor/dolphin/GXRuntime/include/core/types.h
+index e3fe16ab..f9047b5d 100644
+--- a/ModernGekko/vendor/dolphin/GXRuntime/include/core/types.h
++++ b/ModernGekko/vendor/dolphin/GXRuntime/include/core/types.h
+@@ -28,8 +28,8 @@ static inline s32 sign_extend(u32 value, int bits) {
+     return (s32)((value ^ mask) - mask);
+ }
+ 
+-// byte swap
+-static inline u16 bswap16(u16 v) {
++// Parentheses keep these helpers usable alongside the BSD endian macros.
++static inline u16 (bswap16)(u16 v) {
+ #if defined(_MSC_VER)
+     return _byteswap_ushort(v);
+ #else
+@@ -37,7 +37,7 @@ static inline u16 bswap16(u16 v) {
+ #endif
+ }
+ 
+-static inline u32 bswap32(u32 v) {
++static inline u32 (bswap32)(u32 v) {
+     // so we can compile on msvc too
+ #if defined(_MSC_VER)
+     return _byteswap_ulong(v);
+@@ -46,7 +46,7 @@ static inline u32 bswap32(u32 v) {
+ #endif
+ }
+ 
+-static inline u64 bswap64(u64 v) {
++static inline u64 (bswap64)(u64 v) {
+ #if defined(_MSC_VER)
+     return _byteswap_uint64(v);
+ #else
+@@ -58,33 +58,33 @@ static inline u64 bswap64(u64 v) {
+ static inline u16 read_be16(const u8* p) {
+     u16 v;
+     memcpy(&v, p, 2);
+-    return bswap16(v);
++    return (bswap16)(v);
+ }
+ 
+ static inline u32 read_be32(const u8* p) {
+     u32 v;
+     memcpy(&v, p, 4);
+-    return bswap32(v);
++    return (bswap32)(v);
+ }
+ 
+ static inline u64 read_be64(const u8* p) {
+     u64 v;
+     memcpy(&v, p, 8);
+-    return bswap64(v);
++    return (bswap64)(v);
+ }
+ 
+ static inline void write_be16(u8* p, u16 v) {
+-    u16 swapped = bswap16(v);
++    u16 swapped = (bswap16)(v);
+     memcpy(p, &swapped, 2);
+ }
+ 
+ static inline void write_be32(u8* p, u32 v) {
+-    u32 swapped = bswap32(v);
++    u32 swapped = (bswap32)(v);
+     memcpy(p, &swapped, 4);
+ }
+ 
+ static inline void write_be64(u8* p, u64 v) {
+-    u64 swapped = bswap64(v);
++    u64 swapped = (bswap64)(v);
+     memcpy(p, &swapped, 8);
+ }
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/AudioCommon.cpp b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/AudioCommon.cpp
+index 17b64fe9..4798f245 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/AudioCommon.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/AudioCommon.cpp
+@@ -14,6 +14,9 @@
+ #include "AudioCommon/OpenSLESStream.h"
+ #include "AudioCommon/PulseAudioStream.h"
+ #include "AudioCommon/WASAPIStream.h"
++#ifdef MODERNGEKKO_PS5
++#include "AudioCommon/SDLSoundStream.h"
++#endif
+ #include "Common/FileUtil.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/TimeUtil.h"
+@@ -28,6 +31,10 @@ constexpr int AUDIO_VOLUME_MAX = 100;
+ 
+ static std::unique_ptr<SoundStream> CreateSoundStreamForBackend(std::string_view backend)
+ {
++#ifdef MODERNGEKKO_PS5
++  if (backend == SDLSoundStream::BACKEND_NAME)
++    return std::make_unique<SDLSoundStream>();
++#endif
+   if (backend == BACKEND_CUBEB && CubebStream::IsValid())
+     return std::make_unique<CubebStream>();
+   else if (backend == BACKEND_OPENAL && OpenALStream::IsValid())
+@@ -94,7 +101,9 @@ void ShutdownSoundStream(Core::System& system)
+ 
+ std::string GetDefaultSoundBackend()
+ {
+-#if defined(ANDROID)
++#if defined(MODERNGEKKO_PS5)
++  return SDLSoundStream::BACKEND_NAME;
++#elif defined(ANDROID)
+   return BACKEND_OPENSLES;
+ #else
+   if (CubebStream::IsValid())
+@@ -119,6 +128,9 @@ std::vector<std::string> GetSoundBackends()
+   std::vector<std::string> backends;
+ 
+   backends.emplace_back(BACKEND_NULLSOUND);
++#ifdef MODERNGEKKO_PS5
++  backends.emplace_back(SDLSoundStream::BACKEND_NAME);
++#endif
+   if (CubebStream::IsValid())
+     backends.emplace_back(BACKEND_CUBEB);
+   if (AlsaSound::IsValid())
+@@ -155,6 +167,10 @@ bool SupportsLatencyControl(std::string_view backend)
+ 
+ bool SupportsVolumeChanges(std::string_view backend)
+ {
++#ifdef MODERNGEKKO_PS5
++  if (backend == SDLSoundStream::BACKEND_NAME)
++    return true;
++#endif
+   // FIXME: this one should ask the backend whether it supports it.
+   //       but getting the backend from string etc. is probably
+   //       too much just to enable/disable a stupid slider...
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/CMakeLists.txt b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/CMakeLists.txt
+index 04ad9672..081911e7 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/CMakeLists.txt
+@@ -13,6 +13,12 @@ add_library(audiocommon
+   WaveFile.h
+ )
+ 
++if(MODERNGEKKO_PS5)
++  target_sources(audiocommon PRIVATE SDLSoundStream.cpp SDLSoundStream.h)
++  target_compile_definitions(audiocommon PRIVATE MODERNGEKKO_PS5=1)
++  target_link_libraries(audiocommon PRIVATE SDL3::SDL3)
++endif()
++
+ if(ENABLE_CUBEB)
+   message(STATUS "Cubeb found, enabling Cubeb sound backend")
+   target_sources(audiocommon PRIVATE
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Common/MemoryUtil.cpp b/ModernGekko/vendor/dolphin/Source/Core/Common/MemoryUtil.cpp
+index 0d66890d..062df6ef 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Common/MemoryUtil.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Common/MemoryUtil.cpp
+@@ -20,6 +20,7 @@
+ #include <pthread.h>
+ #endif
+ #if defined __APPLE__ || defined __FreeBSD__ || defined __OpenBSD__ || defined __NetBSD__
++#include <sys/types.h>
+ #include <sys/sysctl.h>
+ #elif defined __HAIKU__
+ #include <OS.h>
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Common/WindowSystemInfo.h b/ModernGekko/vendor/dolphin/Source/Core/Common/WindowSystemInfo.h
+index 9d154776..48cc5c23 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Common/WindowSystemInfo.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/Common/WindowSystemInfo.h
+@@ -13,6 +13,7 @@ enum class WindowSystemType
+   Wayland,
+   FBDev,
+   Haiku,
++  Display,
+ };
+ 
+ struct WindowSystemInfo
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/CMakeLists.txt b/ModernGekko/vendor/dolphin/Source/Core/Core/CMakeLists.txt
+index 6491d81d..f1ae4850 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/CMakeLists.txt
+@@ -931,6 +931,10 @@ if(UNIX)
+   )
+ endif()
+ 
++if(MODERNGEKKO_PS5)
++  set_source_files_properties(IOS/Network/IP/Top.cpp PROPERTIES COMPILE_DEFINITIONS MODERNGEKKO_PS5=1)
++endif()
++
+ if(TARGET cpp-ipc::ipc)
+   target_sources(core PRIVATE HW/EXI/BBA/IPC.cpp)
+   target_link_libraries(core PRIVATE cpp-ipc::ipc)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/IOS/Network/IP/Top.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/IOS/Network/IP/Top.cpp
+index a75be0f8..f7a54b02 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/IOS/Network/IP/Top.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/IOS/Network/IP/Top.cpp
+@@ -1094,8 +1094,9 @@ IPCReply NetIPTopDevice::HandleGetInterfaceOptRequest(const IOCtlVRequest& reque
+         FREE(AdapterAddresses);
+       }
+     }
+-#elif (defined(__linux__) && !defined(ANDROID)) || defined(__APPLE__) || defined(__FreeBSD__) ||   \
+-    defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__)
++#elif !defined(MODERNGEKKO_PS5) &&                                                               \
++    ((defined(__linux__) && !defined(ANDROID)) || defined(__APPLE__) || defined(__FreeBSD__) ||    \
++     defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__))
+     if (!Core::WantsDeterminism())
+     {
+       if (res_init() == 0)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h
+index 5b0729a9..be6608b7 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h
+@@ -37,6 +37,9 @@ public:
+   void Stop();
+ 
+   static std::unique_ptr<Platform> CreateHeadlessPlatform();
++#ifdef MODERNGEKKO_PS5
++  static std::unique_ptr<Platform> CreatePS5Platform();
++#endif
+ #ifdef HAVE_WAYLAND
+   static std::unique_ptr<Platform> CreateWaylandPlatform();
+ #endif
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/CMakeLists.txt b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/CMakeLists.txt
+index 6eeac67e..3d93939b 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/CMakeLists.txt
+@@ -1,7 +1,6 @@
+ add_library(inputcommon
+   DynamicInputTextureManager.cpp
+   DynamicInputTextureManager.h
+-  GCAdapter.cpp
+   GCAdapter.h
+   ImageOperations.cpp
+   ImageOperations.h
+@@ -161,10 +160,16 @@ elseif(ANDROID)
+   )
+ endif()
+ 
+-if(NOT ANDROID)
++if(TARGET LibUSB::LibUSB)
+   target_link_libraries(inputcommon PUBLIC LibUSB::LibUSB)
+ endif()
+ 
++if(MODERNGEKKO_PS5)
++  target_sources(inputcommon PRIVATE GCAdapterUnavailable.cpp)
++else()
++  target_sources(inputcommon PRIVATE GCAdapter.cpp)
++endif()
++
+ if(LIBEVDEV_FOUND AND LIBUDEV_FOUND)
+   target_sources(inputcommon
+   PRIVATE
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/UICommon/UICommon.cpp b/ModernGekko/vendor/dolphin/Source/Core/UICommon/UICommon.cpp
+index 01dc87bc..06b3f900 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/UICommon/UICommon.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/UICommon/UICommon.cpp
+@@ -3,6 +3,10 @@
+ 
+ #include "UICommon/UICommon.h"
+ 
++#ifdef RINGOUT_NATIVE_INIT_TRACE
++#include "native_startup.h"
++#endif
++
+ #include <algorithm>
+ #include <clocale>
+ #include <cmath>
+@@ -61,6 +65,15 @@
+ 
+ namespace UICommon
+ {
++static void TraceNativeInit(const char* message)
++{
++#ifdef RINGOUT_NATIVE_INIT_TRACE
++  ringout_native_stage(message);
++#else
++  (void)message;
++#endif
++}
++
+ static Config::ConfigChangedCallbackID s_config_changed_callback_id;
+ static Common::HookableEvent<> s_flush_unsaved_data_event_hook;
+ 
+@@ -127,25 +140,39 @@ static void RefreshConfig()
+ 
+ void Init()
+ {
++  TraceNativeInit("ui: restore Wii settings\n");
+   Core::RestoreWiiSettings(Core::RestoreReason::CrashRecovery);
+ 
++  TraceNativeInit("ui: config init\n");
+   Config::Init();
+   const auto config_changed_callback = [] {
+     InitCustomPaths();
+     RefreshConfig();
+   };
++  TraceNativeInit("ui: register config callback\n");
+   s_config_changed_callback_id = Config::AddConfigChangedCallback(config_changed_callback);
++  TraceNativeInit("ui: load base config\n");
+   Config::AddLayer(ConfigLoaders::GenerateBaseConfigLoader());
++  TraceNativeInit("ui: set dump-texture default\n");
+   Config::SetBaseOrCurrent(Config::GFX_DUMP_TEXTURES, false);
++  TraceNativeInit("ui: save config\n");
+   Config::Save();
++  TraceNativeInit("ui: SConfig init\n");
+   SConfig::Init();
++  TraceNativeInit("ui: graphics config init\n");
+   g_Config.Init();
++  TraceNativeInit("ui: Discord init\n");
+   Discord::Init();
++  TraceNativeInit("ui: log manager init\n");
+   Common::Log::LogManager::Init();
++  TraceNativeInit("ui: activate configured backend\n");
+   VideoBackendBase::ActivateBackend(Config::Get(Config::MAIN_GFX_BACKEND));
++  TraceNativeInit("ui: statistics init\n");
+   Statistics::Init();
+ 
++  TraceNativeInit("ui: refresh config\n");
+   RefreshConfig();
++  TraceNativeInit("ui: init complete\n");
+ }
+ 
+ void Shutdown()
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKMain.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKMain.cpp
+index daca9520..48063229 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKMain.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKMain.cpp
+@@ -145,11 +145,19 @@ bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
+   VulkanContext::PopulateBackendInfo(&g_backend_info);
+   VulkanContext::PopulateBackendInfoAdapters(&g_backend_info, gpu_list);
+ 
++  // Since we haven't called InitializeShared yet, iAdapter may be out of range.
++  size_t selected_adapter_index = static_cast<size_t>(g_Config.iAdapter);
++  if (selected_adapter_index >= gpu_list.size())
++  {
++    WARN_LOG_FMT(VIDEO, "Vulkan adapter index out of range, selecting first adapter.");
++    selected_adapter_index = 0;
++  }
++
+   // We need the surface before we can create a device, as some parameters depend on it.
+   VkSurfaceKHR surface = VK_NULL_HANDLE;
+   if (enable_surface)
+   {
+-    surface = SwapChain::CreateVulkanSurface(instance, wsi);
++    surface = SwapChain::CreateVulkanSurface(instance, gpu_list[selected_adapter_index], wsi);
+     if (surface == VK_NULL_HANDLE)
+     {
+       PanicAlertFmt("Failed to create Vulkan surface.");
+@@ -159,15 +167,6 @@ bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
+     }
+   }
+ 
+-  // Since we haven't called InitializeShared yet, iAdapter may be out of range,
+-  // so we have to check it ourselves.
+-  size_t selected_adapter_index = static_cast<size_t>(g_Config.iAdapter);
+-  if (selected_adapter_index >= gpu_list.size())
+-  {
+-    WARN_LOG_FMT(VIDEO, "Vulkan adapter index out of range, selecting first adapter.");
+-    selected_adapter_index = 0;
+-  }
+-
+   // Now we can create the Vulkan device. VulkanContext takes ownership of the instance and surface.
+   g_vulkan_context =
+       VulkanContext::Create(instance, gpu_list[selected_adapter_index], surface, enable_debug_utils,
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.cpp
+index e55ac2fe..a8c65757 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <vector>
+ 
+ #include "Common/Assert.h"
+ #include "Common/Contains.h"
+@@ -42,8 +43,110 @@ SwapChain::~SwapChain()
+   DestroySurface();
+ }
+ 
+-VkSurfaceKHR SwapChain::CreateVulkanSurface(VkInstance instance, const WindowSystemInfo& wsi)
++static VkSurfaceKHR CreateDisplaySurface(VkInstance instance, VkPhysicalDevice physical_device)
+ {
++  if (!vkGetPhysicalDeviceDisplayPropertiesKHR || !vkGetPhysicalDeviceDisplayPlanePropertiesKHR ||
++      !vkGetDisplayPlaneSupportedDisplaysKHR || !vkGetDisplayModePropertiesKHR ||
++      !vkGetDisplayPlaneCapabilitiesKHR || !vkCreateDisplayPlaneSurfaceKHR)
++  {
++    ERROR_LOG_FMT(VIDEO, "Vulkan: VK_KHR_display entry points missing");
++    return VK_NULL_HANDLE;
++  }
++
++  auto Enumerate = [](auto* output, auto&& query) {
++    uint32_t count = 0;
++    if (query(&count, nullptr) != VK_SUCCESS || count == 0)
++      return false;
++    output->resize(count);
++    if (query(&count, output->data()) != VK_SUCCESS)
++      return false;
++    output->resize(count);
++    return count != 0;
++  };
++
++  std::vector<VkDisplayPropertiesKHR> displays;
++  std::vector<VkDisplayPlanePropertiesKHR> planes;
++  if (!Enumerate(&displays, [&](uint32_t* count, VkDisplayPropertiesKHR* values) {
++        return vkGetPhysicalDeviceDisplayPropertiesKHR(physical_device, count, values);
++      }) ||
++      !Enumerate(&planes, [&](uint32_t* count, VkDisplayPlanePropertiesKHR* values) {
++        return vkGetPhysicalDeviceDisplayPlanePropertiesKHR(physical_device, count, values);
++      }))
++  {
++    ERROR_LOG_FMT(VIDEO, "Vulkan: No display or display plane available");
++    return VK_NULL_HANDLE;
++  }
++
++  for (const auto& display : displays)
++  {
++    if (!(display.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))
++      continue;
++
++    std::vector<VkDisplayModePropertiesKHR> modes;
++    if (!Enumerate(&modes, [&](uint32_t* count, VkDisplayModePropertiesKHR* values) {
++          return vkGetDisplayModePropertiesKHR(physical_device, display.display, count, values);
++        }))
++    {
++      continue;
++    }
++
++    for (uint32_t index = 0; index < planes.size(); ++index)
++    {
++      const auto& plane = planes[index];
++      if (plane.currentDisplay && plane.currentDisplay != display.display)
++        continue;
++
++      std::vector<VkDisplayKHR> supported;
++      if (!Enumerate(&supported, [&](uint32_t* count, VkDisplayKHR* values) {
++            return vkGetDisplayPlaneSupportedDisplaysKHR(physical_device, index, count, values);
++          }) ||
++          std::find(supported.begin(), supported.end(), display.display) == supported.end())
++      {
++        continue;
++      }
++
++      for (const auto& mode : modes)
++      {
++        VkDisplayPlaneCapabilitiesKHR capabilities{};
++        if (vkGetDisplayPlaneCapabilitiesKHR(physical_device, mode.displayMode, index,
++                                             &capabilities) != VK_SUCCESS ||
++            !(capabilities.supportedAlpha & VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR))
++        {
++          continue;
++        }
++
++        const VkDisplaySurfaceCreateInfoKHR info{
++            VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR,
++            nullptr,
++            0,
++            mode.displayMode,
++            index,
++            plane.currentStackIndex,
++            VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
++            1.0f,
++            VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR,
++            mode.parameters.visibleRegion,
++        };
++        VkSurfaceKHR surface = VK_NULL_HANDLE;
++        const VkResult result = vkCreateDisplayPlaneSurfaceKHR(instance, &info, nullptr, &surface);
++        if (result == VK_SUCCESS)
++          return surface;
++
++        LOG_VULKAN_ERROR(result, "vkCreateDisplayPlaneSurfaceKHR failed: ");
++      }
++    }
++  }
++
++  ERROR_LOG_FMT(VIDEO, "Vulkan: No compatible display mode and plane");
++  return VK_NULL_HANDLE;
++}
++
++VkSurfaceKHR SwapChain::CreateVulkanSurface(VkInstance instance, VkPhysicalDevice physical_device,
++                                           const WindowSystemInfo& wsi)
++{
++  if (wsi.type == WindowSystemType::Display)
++    return CreateDisplaySurface(instance, physical_device);
++
+ #if defined(VK_USE_PLATFORM_WIN32_KHR)
+   if (wsi.type == WindowSystemType::Windows)
+   {
+@@ -634,7 +737,8 @@ bool SwapChain::RecreateSurface(void* native_handle)
+ 
+   // Re-create the surface with the new native handle
+   m_wsi.render_surface = native_handle;
+-  m_surface = CreateVulkanSurface(g_vulkan_context->GetVulkanInstance(), m_wsi);
++  m_surface = CreateVulkanSurface(g_vulkan_context->GetVulkanInstance(),
++                                  g_vulkan_context->GetPhysicalDevice(), m_wsi);
+   if (m_surface == VK_NULL_HANDLE)
+     return false;
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.h b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.h
+index 66d9347a..81837094 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.h
+@@ -25,7 +25,8 @@ public:
+   ~SwapChain();
+ 
+   // Creates a vulkan-renderable surface for the specified window handle.
+-  static VkSurfaceKHR CreateVulkanSurface(VkInstance instance, const WindowSystemInfo& wsi);
++  static VkSurfaceKHR CreateVulkanSurface(VkInstance instance, VkPhysicalDevice physical_device,
++                                          const WindowSystemInfo& wsi);
+ 
+   // Create a new swap chain from a pre-existing surface.
+   static std::unique_ptr<SwapChain> Create(const WindowSystemInfo& wsi, VkSurfaceKHR surface,
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanContext.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanContext.cpp
+index 641b5421..f52b291f 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanContext.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanContext.cpp
+@@ -349,6 +349,9 @@ bool VulkanContext::SelectInstanceExtensions(std::vector<const char*>* extension
+     return false;
+   }
+ 
++  if (wstype == WindowSystemType::Display && !AddExtension(VK_KHR_DISPLAY_EXTENSION_NAME, true))
++    return false;
++
+ #if defined(VK_USE_PLATFORM_WIN32_KHR)
+   if (wstype == WindowSystemType::Windows &&
+       !AddExtension(VK_KHR_WIN32_SURFACE_EXTENSION_NAME, true))
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanEntryPoints.inl b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanEntryPoints.inl
+index c262a345..0921456b 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanEntryPoints.inl
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanEntryPoints.inl
+@@ -32,6 +32,12 @@ VULKAN_INSTANCE_ENTRY_POINT(vkCreateDevice, true)
+ VULKAN_INSTANCE_ENTRY_POINT(vkEnumerateDeviceExtensionProperties, true)
+ VULKAN_INSTANCE_ENTRY_POINT(vkEnumerateDeviceLayerProperties, true)
+ VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceSparseImageFormatProperties, true)
++VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceDisplayPropertiesKHR, false)
++VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceDisplayPlanePropertiesKHR, false)
++VULKAN_INSTANCE_ENTRY_POINT(vkGetDisplayPlaneSupportedDisplaysKHR, false)
++VULKAN_INSTANCE_ENTRY_POINT(vkGetDisplayModePropertiesKHR, false)
++VULKAN_INSTANCE_ENTRY_POINT(vkGetDisplayPlaneCapabilitiesKHR, false)
++VULKAN_INSTANCE_ENTRY_POINT(vkCreateDisplayPlaneSurfaceKHR, false)
+ VULKAN_INSTANCE_ENTRY_POINT(vkDestroySurfaceKHR, false)
+ VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceSurfaceSupportKHR, false)
+ VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceSurfaceCapabilitiesKHR, false)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp
+index a761a81a..ba0945ad 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp
+@@ -1,6 +1,8 @@
+ // Copyright 2016 Dolphin Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <type_traits>
++
+ #define VMA_IMPLEMENTATION
+ #include "VideoBackends/Vulkan/VulkanLoader.h"
+ 
+@@ -39,6 +41,10 @@ static void ResetVulkanLibraryFunctionPointers()
+ #undef VULKAN_MODULE_ENTRY_POINT
+ }
+ 
++#if defined(RINGOUT_LINKED_RADV)
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++radv_GetInstanceProcAddr(VkInstance instance, const char* name);
++#else
+ static Common::DynamicLibrary s_vulkan_module;
+ 
+ static bool OpenVulkanLibrary(bool force_system_library)
+@@ -92,8 +98,29 @@ static bool OpenVulkanLibrary(bool force_system_library)
+ #endif
+ }
+ 
+-bool LoadVulkanLibrary(bool force_system_library)
++#endif  // RINGOUT_LINKED_RADV
++
++bool LoadVulkanLibrary([[maybe_unused]] bool force_system_library)
+ {
++#if defined(RINGOUT_LINKED_RADV)
++  auto Load = [](auto& function, const char* name, bool required) {
++    function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
++        radv_GetInstanceProcAddr(VK_NULL_HANDLE, name));
++    if (!function && required)
++      ERROR_LOG_FMT(VIDEO, "Vulkan: Failed to load required module function {}", name);
++    return function || !required;
++  };
++
++  vkGetInstanceProcAddr = radv_GetInstanceProcAddr;
++  if (!Load(vkCreateInstance, "vkCreateInstance", true) ||
++      !Load(vkEnumerateInstanceExtensionProperties, "vkEnumerateInstanceExtensionProperties", true) ||
++      !Load(vkEnumerateInstanceLayerProperties, "vkEnumerateInstanceLayerProperties", true))
++  {
++    ResetVulkanLibraryFunctionPointers();
++    return false;
++  }
++  Load(vkEnumerateInstanceVersion, "vkEnumerateInstanceVersion", false);
++#else
+   if (!s_vulkan_module.IsOpen() && !OpenVulkanLibrary(force_system_library))
+     return false;
+ 
+@@ -107,19 +134,31 @@ bool LoadVulkanLibrary(bool force_system_library)
+   }
+ #include "VideoBackends/Vulkan/VulkanEntryPoints.inl"
+ #undef VULKAN_MODULE_ENTRY_POINT
++#endif
+ 
+   return true;
+ }
+ 
+ void UnloadVulkanLibrary()
+ {
++#if !defined(RINGOUT_LINKED_RADV)
+   s_vulkan_module.Close();
+   if (!s_vulkan_module.IsOpen())
++#endif
+     ResetVulkanLibraryFunctionPointers();
+ }
+ 
+ bool LoadVulkanInstanceFunctions(VkInstance instance)
+ {
++#if defined(RINGOUT_LINKED_RADV)
++  vkGetDeviceProcAddr =
++      reinterpret_cast<PFN_vkGetDeviceProcAddr>(vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr"));
++  if (!vkGetDeviceProcAddr)
++  {
++    ERROR_LOG_FMT(VIDEO, "Vulkan: Failed to load vkGetDeviceProcAddr");
++    return false;
++  }
++#endif
+   bool required_functions_missing = false;
+   auto LoadFunction = [&](PFN_vkVoidFunction* func_ptr, const char* name, bool is_required) {
+     *func_ptr = vkGetInstanceProcAddr(instance, name);
+diff --git a/dist/RingOut-1.0-dist/module-src/CMakeLists.txt b/dist/RingOut-1.0-dist/module-src/CMakeLists.txt
+index f95f11a6..2416793b 100644
+--- a/dist/RingOut-1.0-dist/module-src/CMakeLists.txt
++++ b/dist/RingOut-1.0-dist/module-src/CMakeLists.txt
+@@ -47,7 +47,13 @@ if(CHUNK_OBJECTS AND NOT CHUNK_SOURCES)
+   message(STATUS "module: linking ${GENERATED_DIR}/chunks as LLVM objects")
+ endif()
+ 
+-add_library(${MODULE_NAME} SHARED
++option(MODULE_STATIC "Build an archive for a host with an attached module descriptor" OFF)
++set(MODULE_LIBRARY_TYPE SHARED)
++if(MODULE_STATIC)
++  set(MODULE_LIBRARY_TYPE STATIC)
++endif()
++
++add_library(${MODULE_NAME} ${MODULE_LIBRARY_TYPE}
+   "${MODULE_TEMPLATE}/module_export.c"
+   "${MODULE_TABLES}"
+   "${DOLRECOMP_SRC}/cpu/cpu.c"
