@@ -1,3 +1,23 @@
+diff --git a/DolRecomp/tests/test_gated_pc.c b/DolRecomp/tests/test_gated_pc.c
+index 627fdbda..7cb9d08e 100644
+--- a/DolRecomp/tests/test_gated_pc.c
++++ b/DolRecomp/tests/test_gated_pc.c
+@@ -90,8 +90,14 @@ int main(void) {
+         for (u32 i = 0; i < NRAW; i++) insts[i] = ppc_decode(raws[i], BASE + i * 4u);
+         emit_set_leader_cases(true);
+         emit_collect_entry_points(insts, NRAW, BASE);
+-        char path[] = "/tmp/gated_entries_XXXXXX";
++        const char* tmp = getenv("TEMP");
++        if (!tmp || !*tmp) tmp = getenv("TMPDIR");
++        if (!tmp || !*tmp) tmp = ".";
++        char path[2048];
++        if (snprintf(path, sizeof(path), "%s/gated_entries_XXXXXX", tmp) >= (int)sizeof(path))
++            return 1;
+         int fd = mkstemp(path);
++        if (fd >= 0) close(fd);
+         expect("entry file written", fd >= 0 && emit_write_entry_points(path));
+         char buf[4096] = {0};
+         FILE* f = fopen(path, "r");
 diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
 index 8210d226..cb00ad17 100644
 --- a/ModernGekko/CMakeLists.txt
