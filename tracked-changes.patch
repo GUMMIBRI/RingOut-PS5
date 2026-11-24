@@ -63,7 +63,7 @@ index 8210d226..3a72845a 100644
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
 diff --git a/ModernGekko/include/moderngekko/runtime.hpp b/ModernGekko/include/moderngekko/runtime.hpp
-index 74ea9b1b..2928c439 100644
+index 74ea9b1b..253cc60d 100644
 --- a/ModernGekko/include/moderngekko/runtime.hpp
 +++ b/ModernGekko/include/moderngekko/runtime.hpp
 @@ -4,6 +4,7 @@
@@ -74,25 +74,29 @@ index 74ea9b1b..2928c439 100644
  #include <memory>
  #include <optional>
  #include <string>
-@@ -20,11 +21,24 @@ struct ModuleSource
+@@ -20,11 +21,28 @@ struct ModuleSource
    };
  
    static ModuleSource DynamicPath(std::filesystem::path path);
 -  static ModuleSource AttachedDescriptor(const ModernGekkoModuleDesc* descriptor);
 +  static ModuleSource AttachedDescriptor(const ModernGekkoModuleDesc* descriptor,
-+                                         std::uint32_t gate_groups = 0);
++                                         std::uint32_t gate_groups = 0,
++                                         volatile std::uint32_t* gate_armed = nullptr,
++                                         volatile std::uint32_t* gate_bypass = nullptr);
  
    Kind kind = Kind::None;
    std::filesystem::path path;
    const ModernGekkoModuleDesc* descriptor = nullptr;
 +  std::uint32_t attached_gate_groups = 0;
++  volatile std::uint32_t* attached_gate_armed = nullptr;
++  volatile std::uint32_t* attached_gate_bypass = nullptr;
 +
 +  // An attached module has no dynamic library from which to query exports.
 +  // Missing metadata must leave guest code sites disabled.
 +  std::uint32_t GuestGateGroups(const std::uint32_t* dynamic_export) const
 +  {
 +    if (kind == Kind::AttachedDescriptor)
-+      return attached_gate_groups;
++      return attached_gate_armed && attached_gate_bypass ? attached_gate_groups : 0;
 +    if (kind == Kind::DynamicPath && dynamic_export)
 +      return *dynamic_export;
 +    return 0;
@@ -101,7 +105,7 @@ index 74ea9b1b..2928c439 100644
  
  struct GraphicsSettings
 diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
-index c94c8751..c9312420 100644
+index c94c8751..ad63e153 100644
 --- a/ModernGekko/src/runtime/dolphin_runtime.cpp
 +++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
 @@ -3,6 +3,11 @@
@@ -116,17 +120,21 @@ index c94c8751..c9312420 100644
  #include "VideoCommon/VideoBackendBase.h"
  
  #include "Common/MsgHandler.h"
-@@ -199,14 +204,52 @@ ModuleSource ModuleSource::DynamicPath(std::filesystem::path path) {
+@@ -199,14 +204,56 @@ ModuleSource ModuleSource::DynamicPath(std::filesystem::path path) {
  }
  
  ModuleSource
 -ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
 +ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor,
-+                                 std::uint32_t gate_groups) {
++                                 std::uint32_t gate_groups,
++                                 volatile std::uint32_t *gate_armed,
++                                 volatile std::uint32_t *gate_bypass) {
    ModuleSource source;
    source.kind = Kind::AttachedDescriptor;
    source.descriptor = descriptor;
 +  source.attached_gate_groups = gate_groups;
++  source.attached_gate_armed = gate_armed;
++  source.attached_gate_bypass = gate_bypass;
    return source;
  }
  
@@ -170,7 +178,7 @@ index c94c8751..c9312420 100644
  // A pad profile names its device as a string ("SDL/0/Steam Deck Controller").
  // That string is not stable: on a Steam Deck the same physical pad enumerates as
  // "SDL/0/Steam Deck Controller" or "SDL/0/Steam Virtual Gamepad" depending on
-@@ -417,9 +460,9 @@ std::optional<RuntimeError> ResolveModuleSource(RuntimeConfig &config,
+@@ -417,9 +464,9 @@ std::optional<RuntimeError> ResolveModuleSource(RuntimeConfig &config,
    }
    // The guests' code sites exist only in a module built by setup.sh --spawn/--heihachi (gate group 1).
    {
@@ -183,7 +191,7 @@ index c94c8751..c9312420 100644
    }
    validation_library.Close();
    return {};
-@@ -473,13 +516,17 @@ your game data has been modified and what that does to netplay.
+@@ -473,13 +520,17 @@ your game data has been modified and what that does to netplay.
  }
  
  void InitializeUICommon(const std::filesystem::path &user_directory) {
@@ -201,7 +209,7 @@ index c94c8751..c9312420 100644
    UICommon::Init();
    // Dolphin's default non-Windows alert handler answers "No" to every
    // question, and ASSERT's PanicYesNo treats "No" as "don't ignore" ->
-@@ -489,6 +536,13 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
+@@ -489,6 +540,13 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
    Common::RegisterMsgAlertHandler([](const char *caption, const char *text,
                                       bool yes_no, Common::MsgType style) -> bool {
      std::fprintf(stderr, "[alert] %s: %s\n", caption, text);
@@ -215,7 +223,7 @@ index c94c8751..c9312420 100644
      return true;
    });
  }
-@@ -496,6 +550,9 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
+@@ -496,6 +554,9 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
  std::unique_ptr<Platform> CreateHostPlatform(const RuntimeConfig &config) {
    if (config.headless)
      return Platform::CreateHeadlessPlatform();
@@ -225,7 +233,17 @@ index c94c8751..c9312420 100644
  #ifdef _WIN32
    return Platform::CreateWin32Platform();
  #endif
-@@ -1001,10 +1058,19 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -766,7 +827,8 @@ void ApplyModuleSourceToJit(const ModuleSource &module) {
+         StaticRecompModuleSource::Dynamic(module.path.string()));
+   else if (module.kind == ModuleSource::Kind::AttachedDescriptor)
+     jit.SetStaticRecompModuleSource(StaticRecompModuleSource::Attached(
+-        reinterpret_cast<const StaticRecompModuleDesc *>(module.descriptor)));
++        reinterpret_cast<const StaticRecompModuleDesc *>(module.descriptor),
++        module.attached_gate_armed, module.attached_gate_bypass));
+   else
+     jit.SetStaticRecompModuleSource({});
+ }
+@@ -1001,10 +1063,19 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
          RuntimeError{RuntimeErrorCode::AlreadyActive,
                       "only one ModernGekko runtime may be active per process"}};
  
@@ -245,7 +263,7 @@ index c94c8751..c9312420 100644
    if (auto error = ResolveModuleSource(config, *inspected.metadata))
      return {{}, std::move(*error)};
  
-@@ -1023,11 +1089,13 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1023,11 +1094,13 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    // match the disc it came from? Netplay and the MODS tab both read the answer,
    // and the hash is cached against root.olk's size and mtime so this is only
    // expensive the first time and after an actual patch.
@@ -259,7 +277,7 @@ index c94c8751..c9312420 100644
    impl->platform = CreateHostPlatform(impl->config);
    if (!impl->platform || !impl->platform->Init()) {
      if (impl->ui_initialized)
-@@ -1037,11 +1105,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1037,11 +1110,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
                           "the requested Dolphin host platform is unavailable"}};
    }
  
@@ -276,7 +294,7 @@ index c94c8751..c9312420 100644
    ApplyCoreSettings(impl->metadata);
    ApplyGraphicsSettings(impl->config.graphics, impl->config.headless);
    ApplyAudioSettings(impl->config.audio, impl->config.headless);
-@@ -1049,6 +1122,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1049,6 +1127,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
                    impl->config.input.background_input);
    ApplyModuleSourceToJit(impl->config.module);
  
@@ -284,7 +302,7 @@ index c94c8751..c9312420 100644
    s_runtime_active = true;
    s_platform = impl->platform.get();
    s_window_title = impl->title;
-@@ -1075,6 +1149,7 @@ Runtime::~Runtime() {
+@@ -1075,6 +1154,7 @@ Runtime::~Runtime() {
  }
  
  RuntimeRunResult Runtime::Run() {
@@ -292,7 +310,7 @@ index c94c8751..c9312420 100644
    if (m_impl->running.exchange(true))
      return {RuntimeExitReason::BootFailed,
              RuntimeError{RuntimeErrorCode::InvalidState,
-@@ -1087,6 +1162,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1087,6 +1167,7 @@ RuntimeRunResult Runtime::Run() {
      const char* const env = std::getenv("RINGOUT_GUESTS");
      RecompGuest::SetSession(!(env && env[0] == '0'));
    }
@@ -300,7 +318,7 @@ index c94c8751..c9312420 100644
    std::unique_ptr<BootParameters> boot =
        TakeBootParameters(m_impl->metadata.main_dol.string());
    if (!boot) {
-@@ -1102,6 +1178,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1102,6 +1183,7 @@ RuntimeRunResult Runtime::Run() {
    // The pad plumbing already exists: SI_DeviceGCController calls
    // HandleMoviePadStatus on every poll, which plays a recorded pad back or
    // records the live one. Nothing had ever turned it on.
@@ -308,7 +326,7 @@ index c94c8751..c9312420 100644
    auto& movie = Core::System::GetInstance().GetMovie();
    // A rebuilt session shares this process's MovieManager, and nothing clears
    // its mode when a session ends -- Shutdown() empties the buffers and leaves
-@@ -1169,6 +1246,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1169,6 +1251,7 @@ RuntimeRunResult Runtime::Run() {
                   m_impl->config.record_movie.string().c_str());
    }
  
@@ -316,7 +334,7 @@ index c94c8751..c9312420 100644
    m_impl->state_hook =
        Core::AddOnStateChangedCallback([this](Core::State state) {
          // Written on the STOPPING edge. Core.cpp's EmuThread holds a ScopeGuard
-@@ -1222,6 +1300,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1222,6 +1305,7 @@ RuntimeRunResult Runtime::Run() {
            m_impl->platform->Stop();
        });
    m_impl->reached_running = false;
@@ -324,7 +342,7 @@ index c94c8751..c9312420 100644
    if (!BootManager::BootCore(Core::System::GetInstance(), std::move(boot),
                               m_impl->platform->GetWindowSystemInfo())) {
      m_impl->running = false;
-@@ -1230,18 +1309,23 @@ RuntimeRunResult Runtime::Run() {
+@@ -1230,18 +1314,23 @@ RuntimeRunResult Runtime::Run() {
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;
@@ -929,6 +947,56 @@ index a75be0f8..f7a54b02 100644
      if (!Core::WantsDeterminism())
      {
        if (res_init() == 0)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 15a230d0..65163532 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -440,8 +440,16 @@ void StaticRecompCore::LoadModule()
+     m_layer_hooks = StaticRecompFindRenderLayerHooks(desc->game_id);
+     // The gate (DolRecomp --gated-pc). Every current module exports it; only
+     // one generated with the layer hooks gated tests it.
+-    m_gate_armed = static_cast<volatile u32*>(m_library.GetSymbolAddress("dolrecomp_gate_armed"));
+-    m_gate_bypass = static_cast<volatile u32*>(m_library.GetSymbolAddress("dolrecomp_gate_bypass"));
++    if (m_module_source.kind == StaticRecompModuleSource::Kind::AttachedDescriptor)
++    {
++      m_gate_armed = m_module_source.gate_armed;
++      m_gate_bypass = m_module_source.gate_bypass;
++    }
++    else
++    {
++      m_gate_armed = static_cast<volatile u32*>(m_library.GetSymbolAddress("dolrecomp_gate_armed"));
++      m_gate_bypass = static_cast<volatile u32*>(m_library.GetSymbolAddress("dolrecomp_gate_bypass"));
++    }
+     m_gate_factor_addr = 0;
+     m_gate_on = false;
+     m_spawn_gate_on = false;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h
+index 553a35ec..d8db80d5 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h
+@@ -25,15 +25,21 @@ struct StaticRecompModuleSource
+     return source;
+   }
+ 
+-  static StaticRecompModuleSource Attached(const StaticRecompModuleDesc* descriptor_)
++  static StaticRecompModuleSource Attached(const StaticRecompModuleDesc* descriptor_,
++                                          volatile u32* gate_armed_ = nullptr,
++                                          volatile u32* gate_bypass_ = nullptr)
+   {
+     StaticRecompModuleSource source;
+     source.kind = Kind::AttachedDescriptor;
+     source.descriptor = descriptor_;
++    source.gate_armed = gate_armed_;
++    source.gate_bypass = gate_bypass_;
+     return source;
+   }
+ 
+   Kind kind = Kind::None;
+   std::string path;
+   const StaticRecompModuleDesc* descriptor = nullptr;
++  volatile u32* gate_armed = nullptr;
++  volatile u32* gate_bypass = nullptr;
+ };
 diff --git a/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp b/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp
 index 57787368..62e8612c 100644
 --- a/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp
