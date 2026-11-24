@@ -1,4 +1,4 @@
-import json, pathlib, subprocess, sys, tempfile, unittest
+import hashlib, json, pathlib, shutil, subprocess, sys, tempfile, unittest
 SCRIPT=pathlib.Path(__file__).with_name('build-package.py')
 ROLLBACK=pathlib.Path('C:/SC2/Taki-RingOut/aot-work/ps5-aot-grseaf-r1/staged-native-r7')
 class RecipePlanTest(unittest.TestCase):
@@ -32,4 +32,21 @@ class RecipePlanTest(unittest.TestCase):
    self.assertNotEqual(result.returncode,0)
    self.assertIn('requires BUILD-ATTESTATION.json',result.stderr)
    self.assertFalse(stage.exists())
+ def test_host_attestation_rejects_changed_game_module(self):
+  if not shutil.which('git'): self.skipTest('git is required')
+  with tempfile.TemporaryDirectory(prefix='ringout-attest-') as t:
+   root=pathlib.Path(t)/'repo'; script=root/'ModernGekko/ps5/build-native.py'
+   script.parent.mkdir(parents=True);shutil.copyfile(SCRIPT.with_name('build-native.py'),script)
+   subprocess.run(['git','init','-q',str(root)],check=True)
+   subprocess.run(['git','-C',str(root),'add','ModernGekko'],check=True)
+   subprocess.run(['git','-C',str(root),'-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','fixture'],check=True)
+   revision=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip()
+   host=pathlib.Path(t)/'host';host.mkdir(); (host/'build.ninja').write_bytes(b'fixture')
+   module=pathlib.Path(t)/'game.a';module.write_bytes(b'changed')
+   attestation={'status':'success','source_root':str(root),'source_revision':revision,
+    'build_ninja_sha256':hashlib.sha256(b'fixture').hexdigest(),
+    'game_module':{'path':str(module),'sha256':hashlib.sha256(b'original').hexdigest()}}
+   (host/'BUILD-ATTESTATION.json').write_text(json.dumps(attestation))
+   stage=pathlib.Path(t)/'stage';result=subprocess.run([sys.executable,str(script),'--stage',str(stage),'--build-id','x','--host-build',str(host)],capture_output=True,text=True)
+   self.assertNotEqual(result.returncode,0);self.assertIn('game module hash differs',result.stderr);self.assertFalse(stage.exists())
 if __name__=='__main__':unittest.main()

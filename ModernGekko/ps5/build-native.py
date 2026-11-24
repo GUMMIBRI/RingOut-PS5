@@ -31,6 +31,7 @@ if revision.returncode:
     parser.error('cannot identify source revision')
 work = workspace / 'aot-work/ps5-aot-grseaf-r1'
 host_build = Path(args.host_build).resolve() if args.host_build else work / 'host-build-sdk'
+game_module = work / 'build/gGRSEAF_recomp.a'
 if args.host_build:
     attestation_path = host_build / 'BUILD-ATTESTATION.json'
     if not attestation_path.is_file():
@@ -45,6 +46,13 @@ if args.host_build:
                            capture_output=True, text=True)
     if dirty.returncode or dirty.stdout.strip():
         parser.error('fresh host build requires a clean tracked source checkout')
+    module_record = attestation.get('game_module', {})
+    game_module = Path(module_record.get('path', '')).resolve()
+    if not game_module.is_file():
+        parser.error('attested game module is missing')
+    with game_module.open('rb') as stream:
+        if hashlib.file_digest(stream, 'sha256').hexdigest() != module_record.get('sha256'):
+            parser.error('attested game module hash differs')
     archives = attestation.get('archives', {})
     if not archives:
         parser.error('fresh host build attestation has no archive hashes')
@@ -242,6 +250,7 @@ substitutions = {
     'CMakeFiles/ringout_ps5.dir/ps5/startup_log.c.o': str(stage / 'native_startup_log.c.o'),
     'libmoderngekko.a': str(runtime_archive),
     'vendor/dolphin/Source/Core/UICommon/libuicommon.a': str(ui_archive),
+    str(work / 'build/gGRSEAF_recomp.a'): str(game_module),
     str(work / 'staged-native-r3/ringout-native-r3.elf'): str(stage / 'ringout-native.elf')}
 substitutions.update(boot_archives)
 substitutions = {key.replace('\\', '/'): value for key, value in substitutions.items()}
