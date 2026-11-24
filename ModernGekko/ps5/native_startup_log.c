@@ -15,6 +15,15 @@ enum { SlotCount = 6, ByteLimit = 64 * 1024 };
 static int descriptor = -1;
 static int attempted;
 static size_t remaining;
+/* Main and emulation threads share this early logger; avoid races without
+ * depending on libc or TLS before _init_env. */
+static int log_lock;
+static void lock_log(void)
+{
+    while (__atomic_exchange_n(&log_lock, 1, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause");
+}
+static void unlock_log(void) { __atomic_store_n(&log_lock, 0, __ATOMIC_RELEASE); }
 
 static void slot_path(char* path, unsigned slot)
 {
@@ -125,18 +134,24 @@ static int open_session(void)
 
 void ringout_native_stage(const char* message)
 {
+    lock_log();
     if (open_session() >= 0) (void)write_message(message);
+    unlock_log();
 }
 
 void ringout_native_value(const char* label, unsigned long long value)
 {
+    lock_log();
     if (open_session() >= 0) (void)write_value(label, value);
+    unlock_log();
 }
 
 void ringout_native_close(void)
 {
+    lock_log();
     if (descriptor >= 0) (void)sceKernelClose(descriptor);
     descriptor = -1;
+    unlock_log();
 }
 
 int ringout_log_open(RingOutStartupLog* log, const char* directory)
@@ -144,21 +159,28 @@ int ringout_log_open(RingOutStartupLog* log, const char* directory)
     // Native startup and main share one slot even before user-directory creation.
     (void)directory;
     log->file = NULL;
+    lock_log();
     int fd = open_session();
     log->remaining = remaining;
+    unlock_log();
     return fd < 0 ? -1 : 0;
 }
 
 int ringout_log_write(RingOutStartupLog* log, const char* message)
 {
+    lock_log();
     int result = write_message(message);
     log->remaining = remaining;
+    unlock_log();
     return result;
 }
 
 int ringout_log_close(RingOutStartupLog* log)
 {
     // The CRT still records main's return and destructors; it closes the descriptor.
+    lock_log();
     log->remaining = remaining;
-    return descriptor < 0 ? 0 : sceKernelFsync(descriptor);
+    int result = descriptor < 0 ? 0 : sceKernelFsync(descriptor);
+    unlock_log();
+    return result;
 }

@@ -14,13 +14,26 @@ import subprocess
 parser = argparse.ArgumentParser()
 parser.add_argument('--stage', required=True)
 parser.add_argument('--build-id', required=True)
+parser.add_argument('--include-ps5-menu', action='store_true',
+                    help='rebuild the PS5 host loop with the menu lifecycle integration')
+parser.add_argument('--trace-boot', action='store_true', help='rebuild Dolphin boot phase tracers')
+parser.add_argument('--use-title-heap', action='store_true', help='use PS5 platform direct-memory title heap')
 args = parser.parse_args()
 if not args.build_id or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._' for c in args.build_id):
     parser.error('--build-id must contain only letters, digits, dash, dot or underscore')
 workspace = Path(__file__).resolve().parents[3]
 source = workspace / 'source/ModernGekko/ps5'
+if Path(__file__).resolve().parent != source.resolve():
+    parser.error('this pinned recipe uses a different source checkout and old host archives; configure and rebuild for this checkout first')
+revision = subprocess.run(['git', '-C', str(workspace / 'source'), 'rev-parse', 'HEAD'],
+                          capture_output=True, text=True)
+if revision.returncode or revision.stdout.strip() != '9339899231d9cf90282c7b4c17eb1cf0c3c4e14c':
+    parser.error('host archives are pinned to the older source revision; rebuild them before producing a candidate')
 work = workspace / 'aot-work/ps5-aot-grseaf-r1'
-stage = Path(args.stage).resolve()
+# Preserve a mapped drive: the pinned converter cannot write UNC output paths.
+stage = Path(args.stage).absolute()
+if str(stage).startswith('\\\\'):
+    parser.error('use a local or mapped-drive stage path, not UNC')
 if stage.exists() and any(stage.iterdir()):
     parser.error('--stage must be new or empty; finalized candidates are immutable')
 stage.mkdir(parents=True, exist_ok=True)
@@ -97,6 +110,18 @@ for name in ['game.cpp', 'dolphin_runtime.cpp']:
         compile_args[compile_args.index(flag) + 1] = str(value)
     run(compile_args, host_build)
     runtime_objects.append(output)
+if args.include_ps5_menu:
+    item = source / 'platform.cpp'
+    inputs.append(record(item))
+    target = 'CMakeFiles/moderngekko.dir/ps5/platform.cpp.o'
+    compile_args = windows_argv(run([ninja, '-t', 'commands', target], host_build).strip().splitlines()[-1])
+    assert Path(compile_args[0]) == llvm / 'clang++.exe'
+    assert Path(compile_args[compile_args.index('-c') + 1]) == item
+    output = stage / 'ps5_platform.o'
+    for flag, value in [('-o', output), ('-MF', stage / 'platform.cpp.d'), ('-MT', output)]:
+        compile_args[compile_args.index(flag) + 1] = str(value)
+    run(compile_args, host_build)
+    runtime_objects.append(output)
 original_archive = host_build / 'libmoderngekko.a'
 with original_archive.open('rb') as stream:
     assert stream.read(8) == b'!<arch>\n', 'thin archives require explicit member relocation'
@@ -105,6 +130,23 @@ for item in [host_build / 'build.ninja', host_build / 'CMakeFiles/rules.ninja', 
     inputs.append(record(item))
 runtime_archive = stage / 'libmoderngekko.a'
 shutil.copyfile(original_archive, runtime_archive)
+if args.include_ps5_menu:
+    # LLVM's Windows archive replacement compares member names without case.
+    # Platform.cpp.o and platform.cpp.o coexist; rename only the exact PS5
+    # member in the staged copy before removing it, preserving Dolphin's one.
+    data = bytearray(runtime_archive.read_bytes())
+    offset = 8
+    found = 0
+    while offset < len(data):
+        header = data[offset:offset + 60]
+        size = int(header[48:58])
+        if header[:16].rstrip() == b'platform.cpp.o/':
+            data[offset:offset + 16] = b'ps5_old.cpp.o/  '
+            found += 1
+        offset += 60 + size + (size % 2)
+    assert offset == len(data) and found == 1
+    runtime_archive.write_bytes(data)
+    run([llvm / 'llvm-ar.exe', 'd', runtime_archive, 'ps5_old.cpp.o'])
 run([llvm / 'llvm-ar.exe', 'r', runtime_archive, *runtime_objects])
 members = run([llvm / 'llvm-ar.exe', 't', runtime_archive]).splitlines()
 for item in runtime_objects:
@@ -132,6 +174,36 @@ shutil.copyfile(original_ui_archive, ui_archive)
 run([llvm / 'llvm-ar.exe', 'r', ui_archive, ui_object])
 assert run([llvm / 'llvm-ar.exe', 't', ui_archive]).splitlines().count(ui_object.name) == 1
 
+# Optional bounded diagnostic: preserve host archives, replace only named boot
+# members in staged copies, and retain the exact Ninja commands and inputs.
+boot_archives = {}
+if args.trace_boot:
+    for library, members_spec in [
+        ('Core', [('Boot/BootParameters.cpp', 'BootParameters.cpp'), ('Boot/BootManager.cpp', 'BootManager.cpp'), ('Core.cpp', 'Core.cpp')]),
+        ('DiscIO', [('DirectoryBlob.cpp', 'DirectoryBlob.cpp')])]:
+        libname = 'libcore.a' if library == 'Core' else 'libdiscio.a'
+        original = host_build / 'vendor/dolphin/Source/Core' / library / libname
+        archive = stage / libname
+        inputs.append(record(original))
+        shutil.copyfile(original, archive)
+        objects = []
+        for relative, name in members_spec:
+            item = source.parent / 'vendor/dolphin/Source/Core' / library / relative
+            target = f'vendor/dolphin/Source/Core/{library}/CMakeFiles/{library.lower()}.dir/{relative}.o'
+            inputs.append(record(item))
+            argv = windows_argv(run([ninja, '-t', 'commands', target], host_build).strip().splitlines()[-1])
+            assert Path(argv[0]) == llvm / 'clang++.exe' and Path(argv[argv.index('-c') + 1]) == item
+            obj = stage / (name + '.o')
+            for flag, value in [('-o', obj), ('-MF', stage / (name + '.d')), ('-MT', obj)]:
+                argv[argv.index(flag) + 1] = str(value)
+            argv[1:1] = ['-DRINGOUT_BOOT_TRACE=1', '-I', str(source)]
+            run(argv, host_build)
+            objects.append(obj)
+        run([llvm / 'llvm-ar.exe', 'r', archive, *objects])
+        archive_members = run([llvm / 'llvm-ar.exe', 't', archive]).splitlines()
+        assert all(archive_members.count(obj.name) == 1 for obj in objects)
+        boot_archives['vendor/dolphin/Source/Core/' + library + '/' + libname] = str(archive)
+
 fp = work / 'staged-native-r3/fp.o'
 inputs.append(record(fp))
 link = json.loads((work / 'staged-native-r3/link-args.json').read_text())
@@ -142,6 +214,7 @@ substitutions = {
     'libmoderngekko.a': str(runtime_archive),
     'vendor/dolphin/Source/Core/UICommon/libuicommon.a': str(ui_archive),
     str(work / 'staged-native-r3/ringout-native-r3.elf'): str(stage / 'ringout-native.elf')}
+substitutions.update(boot_archives)
 substitutions = {key.replace('\\', '/'): value for key, value in substitutions.items()}
 link = [substitutions.get(x.replace('\\', '/'), x) for x in link]
 assert Path(link[link.index('-o') + 1]) == stage / 'ringout-native.elf'
@@ -149,6 +222,17 @@ position = link.index(str(stage / 'main.cpp.o'))
 link[position:position] = [str(stage / 'posix_filesystem.c.o')]
 link[:0] = ['--defsym=' + name + '=ps5_' + name
             for name in ['fork', 'link', 'dup', 'symlink', 'readlink', 'pathconf', 'isatty']]
+# RADV's WSI obtains this callback through a weak entrypoint table. Weak
+# references do not extract the provider from the static archive; without it,
+# wsi_device_init calls a null GetPhysicalDeviceProperties2 during startup.
+link.insert(0, '--undefined=vk_common_GetPhysicalDeviceProperties2')
+if args.use_title_heap:
+    # Existing PS5 platform archive provides the same synchronized segmented
+    # direct-memory allocator used by the working SC2 title. Keep the entire
+    # allocation family consistent, including libc-allocated foreign pointers.
+    link[:0] = ['--wrap=' + name for name in ['malloc', 'calloc', 'realloc', 'free',
+               'posix_memalign', 'aligned_alloc', 'memalign', 'malloc_usable_size',
+               'reallocf', 'reallocarray', 'getline', 'getdelim']]
 (stage / 'link-args.json').write_text(json.dumps(link, indent=2))
 for entry in link:
     path = Path(entry)
@@ -156,6 +240,12 @@ for entry in link:
     if path.is_file() and path.suffix in ('.a', '.o', '.so', '.ld', '.map'):
         inputs.append(record(path))
 run([llvm / 'ld.lld.exe', *link], work / 'host-build-sdk')
+definitions = run([llvm / 'llvm-nm.exe', '--defined-only', stage / 'ringout-native.elf'])
+assert any(line.split()[-1:] == ['vk_common_GetPhysicalDeviceProperties2']
+           for line in definitions.splitlines()), 'RADV physical-device callback is missing'
+if args.use_title_heap:
+    for symbol in ['__wrap_malloc', '__wrap_free', 'ps5_heap_malloc', 'ps5_heap_owns']:
+        assert any(line.split()[-1:] == [symbol] for line in definitions.splitlines()), f'missing heap symbol {symbol}'
 run([converter, 'link', '--in', stage / 'ringout-native.elf', '--out', stage / 'eboot.elf',
      '--stub-dir', sdk / 'target/lib', '--file-name', 'eboot.elf'])
 run([converter, 'self', '--sign', '--in', stage / 'eboot.elf', '--out', stage / 'eboot.bin'])
@@ -163,6 +253,9 @@ inspection = run([converter, 'self', '--inspect', '--file', stage / 'eboot.bin']
 (stage / 'self-inspect.txt').write_text(inspection)
 revision = run(['git', '-C', workspace / 'source', 'rev-parse', 'HEAD']).strip()
 receipt = {'build_id': args.build_id, 'source_revision': revision,
+           'include_ps5_menu': args.include_ps5_menu,
+           'trace_boot': args.trace_boot,
+           'use_title_heap': args.use_title_heap,
            'source_state': 'working tree; exact linked source/input hashes below',
            'inputs': inputs, 'tools': [record(llvm / x) for x in ['clang.exe', 'clang++.exe', 'ld.lld.exe', 'llvm-ar.exe']],
            'converter': record(converter), 'input_elf': record(stage / 'ringout-native.elf'),

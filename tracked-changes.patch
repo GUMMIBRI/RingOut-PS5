@@ -1,5 +1,5 @@
 diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
-index 1e713c07..a3c35f8c 100644
+index 8210d226..1cc88d78 100644
 --- a/ModernGekko/CMakeLists.txt
 +++ b/ModernGekko/CMakeLists.txt
 @@ -56,6 +56,16 @@ option(MODERNGEKKO_ENABLE_DYNAMIC_MODULES
@@ -35,7 +35,7 @@ index 1e713c07..a3c35f8c 100644
      set(ENABLE_EGL OFF CACHE BOOL "" FORCE)
      # Vendored by default, as every other dependency here is: the shipped
      # builds must not vary with whatever SDL a build machine happens to have.
-@@ -350,6 +367,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -359,6 +376,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
          target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
      endif()
      target_link_libraries(moderngekko PRIVATE core uicommon)
@@ -50,200 +50,8 @@ index 1e713c07..a3c35f8c 100644
      if(TARGET PkgConfig::X11)
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
-diff --git a/ModernGekko/ps5/main.cpp b/ModernGekko/ps5/main.cpp
-new file mode 100644
-index 00000000..b0b4f2f4
---- /dev/null
-+++ b/ModernGekko/ps5/main.cpp
-@@ -0,0 +1,83 @@
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+#include "moderngekko/runtime.hpp"
-+#include "native_startup.h"
-+
-+extern "C" {
-+#include "startup_log.h"
-+const ModernGekkoModuleDesc* staticrecomp_get_module(void);
-+}
-+
-+#include <exception>
-+#include <filesystem>
-+#include <utility>
-+
-+int main(int argc, char** argv)
-+{
-+    ringout_native_stage("main entered\n");
-+    ringout_native_value("argc ", static_cast<unsigned>(argc));
-+    if ((argc != 1 && argc != 3) || !argv || !argv[0] ||
-+        (argc == 3 && (!argv[1] || !argv[2])))
-+    {
-+        ringout_native_stage("Invalid launch arguments\n");
-+        std::fputs("Usage: RingOut [<game-directory> <user-directory>]\n", stderr);
-+        return 2;
-+    }
-+    RingOutStartupLog log{};
-+    if (ringout_log_open(&log, nullptr) != 0)
-+        std::fputs("RingOut: could not open startup log\n", stderr);
-+
-+    int status = 1;
-+    try
-+    {
-+        // Launchers may pass only eboot.bin. Resolving it via current_path invoked
-+        // libc's raw pathconf syscall before any diagnostics. Use the known app
-+        // contract in that case; absolute executable paths remain portable.
-+        const std::filesystem::path executable(argv[0]);
-+        const auto app_directory = executable.is_absolute() ? executable.parent_path() :
-+                                                              std::filesystem::path(RINGOUT_APP_ROOT);
-+        ringout_log_write(&log, "App directory ");
-+        ringout_log_write(&log, app_directory.string().c_str());
-+        ringout_log_write(&log, "\n");
-+        const std::filesystem::path game_directory = argc == 3 ? argv[1] : app_directory / "game";
-+        const std::filesystem::path user_directory = argc == 3 ? argv[2] : app_directory / "user";
-+        std::error_code error;
-+        std::filesystem::create_directories(user_directory, error);
-+        if (error)
-+        {
-+            ringout_log_write(&log, "Could not create user directory ");
-+            ringout_log_write(&log, error.message().c_str());
-+            return 2;
-+        }
-+        ringout_log_write(&log, "Creating RingOut runtime\n");
-+        moderngekko::RuntimeConfig config;
-+        config.game_root = game_directory;
-+        config.user_directory = user_directory;
-+        ringout_log_write(&log, "Attaching recompiled game module\n");
-+        config.module = moderngekko::ModuleSource::AttachedDescriptor(staticrecomp_get_module());
-+        config.graphics.backend = "Vulkan";
-+        config.graphics.internal_resolution_scale = 1;
-+        config.show_fps_in_title = false;
-+        ringout_log_write(&log, "Creating runtime; requested graphics backend Vulkan\n");
-+        auto result = moderngekko::Runtime::Create(std::move(config));
-+        if (result)
-+        {
-+            ringout_log_write(&log, "Starting game\n");
-+            const auto run = result.runtime->Run();
-+            if (run.error)
-+                ringout_log_write(&log, run.error->message.c_str());
-+            else if (run.reason == moderngekko::RuntimeExitReason::Stopped)
-+                status = 0;
-+        }
-+        else if (result.error)
-+        {
-+            ringout_log_write(&log, result.error->message.c_str());
-+        }
-+    }
-+    catch (const std::exception& error)
-+    {
-+        ringout_log_write(&log, error.what());
-+    }
-+
-+    ringout_log_write(&log, status == 0 ? "\nRuntime stopped\n" : "\nRuntime failed\n");
-+    return ringout_log_close(&log) == 0 ? status : 1;
-+}
-diff --git a/ModernGekko/ps5/startup_log.c b/ModernGekko/ps5/startup_log.c
-new file mode 100644
-index 00000000..60053477
---- /dev/null
-+++ b/ModernGekko/ps5/startup_log.c
-@@ -0,0 +1,75 @@
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+#include "startup_log.h"
-+
-+#include <inttypes.h>
-+#include <stdint.h>
-+#include <string.h>
-+
-+enum { SlotCount = 6, ByteLimit = 64 * 1024 };
-+
-+int ringout_log_open(RingOutStartupLog* log, const char* directory)
-+{
-+    char path[1024];
-+    uint64_t newest = 0;
-+    unsigned next = 0;
-+    *log = (RingOutStartupLog){0};
-+
-+    for (unsigned slot = 0; slot < SlotCount; ++slot)
-+    {
-+        int length = snprintf(path, sizeof(path), "%s/startup-%u.log", directory, slot);
-+        if (length < 0 || (size_t)length >= sizeof(path))
-+            return -1;
-+
-+        FILE* previous = fopen(path, "rb");
-+        if (previous)
-+        {
-+            uint64_t generation = 0;
-+            if (fscanf(previous, "run %" SCNu64, &generation) == 1 && generation > newest)
-+            {
-+                newest = generation;
-+                next = (slot + 1) % SlotCount;
-+            }
-+            fclose(previous);
-+        }
-+    }
-+
-+    if (newest == UINT64_MAX)
-+        return -1;
-+
-+    snprintf(path, sizeof(path), "%s/startup-%u.log", directory, next);
-+    log->file = fopen(path, "wb");
-+    if (!log->file)
-+        return -1;
-+
-+    int length = fprintf(log->file, "run %" PRIu64 "\n", newest + 1);
-+    if (length < 0 || fflush(log->file) != 0)
-+    {
-+        ringout_log_close(log);
-+        return -1;
-+    }
-+
-+    log->remaining = ByteLimit - (size_t)length;
-+    return 0;
-+}
-+
-+int ringout_log_write(RingOutStartupLog* log, const char* message)
-+{
-+    if (!log->file)
-+        return -1;
-+
-+    size_t length = strlen(message);
-+    if (length > log->remaining)
-+        length = log->remaining;
-+
-+    size_t written = fwrite(message, 1, length, log->file);
-+    log->remaining -= written;
-+    int flush_status = fflush(log->file);
-+    return written == length && flush_status == 0 ? 0 : -1;
-+}
-+
-+int ringout_log_close(RingOutStartupLog* log)
-+{
-+    int status = log->file ? fclose(log->file) : 0;
-+    *log = (RingOutStartupLog){0};
-+    return status;
-+}
-diff --git a/ModernGekko/ps5/startup_log.h b/ModernGekko/ps5/startup_log.h
-new file mode 100644
-index 00000000..f1a2c391
---- /dev/null
-+++ b/ModernGekko/ps5/startup_log.h
-@@ -0,0 +1,16 @@
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+#pragma once
-+
-+#include <stddef.h>
-+#include <stdio.h>
-+
-+// One writer per app instance. The caller supplies a private, writable log directory.
-+typedef struct RingOutStartupLog
-+{
-+    FILE* file;
-+    size_t remaining;
-+} RingOutStartupLog;
-+
-+int ringout_log_open(RingOutStartupLog* log, const char* directory);
-+int ringout_log_write(RingOutStartupLog* log, const char* message);
-+int ringout_log_close(RingOutStartupLog* log);
 diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
-index b85977cc..3953c18b 100644
+index c94c8751..60bf412d 100644
 --- a/ModernGekko/src/runtime/dolphin_runtime.cpp
 +++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
 @@ -3,6 +3,11 @@
@@ -258,7 +66,7 @@ index b85977cc..3953c18b 100644
  #include "VideoCommon/VideoBackendBase.h"
  
  #include "Common/MsgHandler.h"
-@@ -205,6 +210,42 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
+@@ -207,6 +212,42 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
  }
  
  namespace {
@@ -301,7 +109,7 @@ index b85977cc..3953c18b 100644
  // A pad profile names its device as a string ("SDL/0/Steam Deck Controller").
  // That string is not stable: on a Steam Deck the same physical pad enumerates as
  // "SDL/0/Steam Deck Controller" or "SDL/0/Steam Virtual Gamepad" depending on
-@@ -421,13 +462,17 @@ your game data has been modified and what that does to netplay.
+@@ -473,13 +514,17 @@ your game data has been modified and what that does to netplay.
  }
  
  void InitializeUICommon(const std::filesystem::path &user_directory) {
@@ -319,7 +127,21 @@ index b85977cc..3953c18b 100644
    UICommon::Init();
    // Dolphin's default non-Windows alert handler answers "No" to every
    // question, and ASSERT's PanicYesNo treats "No" as "don't ignore" ->
-@@ -444,6 +489,9 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
+@@ -489,6 +534,13 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
+   Common::RegisterMsgAlertHandler([](const char *caption, const char *text,
+                                      bool yes_no, Common::MsgType style) -> bool {
+     std::fprintf(stderr, "[alert] %s: %s\n", caption, text);
++#ifdef MODERNGEKKO_PS5
++    RuntimeStage("alert: ");
++    RuntimeStage(caption ? caption : "");
++    RuntimeStage(": ");
++    RuntimeStage(text ? text : "");
++    RuntimeStage("\n");
++#endif
+     return true;
+   });
+ }
+@@ -496,6 +548,9 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
  std::unique_ptr<Platform> CreateHostPlatform(const RuntimeConfig &config) {
    if (config.headless)
      return Platform::CreateHeadlessPlatform();
@@ -329,7 +151,7 @@ index b85977cc..3953c18b 100644
  #ifdef _WIN32
    return Platform::CreateWin32Platform();
  #endif
-@@ -949,10 +997,19 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1001,10 +1056,19 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
          RuntimeError{RuntimeErrorCode::AlreadyActive,
                       "only one ModernGekko runtime may be active per process"}};
  
@@ -349,19 +171,21 @@ index b85977cc..3953c18b 100644
    if (auto error = ResolveModuleSource(config, *inspected.metadata))
      return {{}, std::move(*error)};
  
-@@ -971,9 +1028,11 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1023,11 +1087,13 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    // match the disc it came from? Netplay and the MODS tab both read the answer,
    // and the hash is cached against root.olk's size and mtime so this is only
    // expensive the first time and after an actual patch.
 +  RuntimeStage("runtime: initialize game data\n");
    RecompGameData::Initialize(impl->config.game_root.string(),
                               impl->config.user_directory.string());
+   // Guest characters are trusted only when their archive was built from THIS root.olk.
+   RecompGuest::Initialize(impl->config.game_root.string(), RecompGameData::Get().current);
  
 +  RuntimeStage("runtime: create and initialize platform\n");
    impl->platform = CreateHostPlatform(impl->config);
    if (!impl->platform || !impl->platform->Init()) {
      if (impl->ui_initialized)
-@@ -983,11 +1042,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1037,11 +1103,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
                           "the requested Dolphin host platform is unavailable"}};
    }
  
@@ -378,7 +202,7 @@ index b85977cc..3953c18b 100644
    ApplyCoreSettings(impl->metadata);
    ApplyGraphicsSettings(impl->config.graphics, impl->config.headless);
    ApplyAudioSettings(impl->config.audio, impl->config.headless);
-@@ -995,6 +1059,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1049,6 +1120,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
                    impl->config.input.background_input);
    ApplyModuleSourceToJit(impl->config.module);
  
@@ -386,7 +210,7 @@ index b85977cc..3953c18b 100644
    s_runtime_active = true;
    s_platform = impl->platform.get();
    s_window_title = impl->title;
-@@ -1021,11 +1086,13 @@ Runtime::~Runtime() {
+@@ -1075,6 +1147,7 @@ Runtime::~Runtime() {
  }
  
  RuntimeRunResult Runtime::Run() {
@@ -394,13 +218,15 @@ index b85977cc..3953c18b 100644
    if (m_impl->running.exchange(true))
      return {RuntimeExitReason::BootFailed,
              RuntimeError{RuntimeErrorCode::InvalidState,
-                          "runtime is already running"}};
- 
+@@ -1087,6 +1160,7 @@ RuntimeRunResult Runtime::Run() {
+     const char* const env = std::getenv("RINGOUT_GUESTS");
+     RecompGuest::SetSession(!(env && env[0] == '0'));
+   }
 +  RuntimeStage("run: create boot parameters\n");
    std::unique_ptr<BootParameters> boot =
        TakeBootParameters(m_impl->metadata.main_dol.string());
    if (!boot) {
-@@ -1041,6 +1108,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1102,6 +1176,7 @@ RuntimeRunResult Runtime::Run() {
    // The pad plumbing already exists: SI_DeviceGCController calls
    // HandleMoviePadStatus on every poll, which plays a recorded pad back or
    // records the live one. Nothing had ever turned it on.
@@ -408,7 +234,7 @@ index b85977cc..3953c18b 100644
    auto& movie = Core::System::GetInstance().GetMovie();
    // A rebuilt session shares this process's MovieManager, and nothing clears
    // its mode when a session ends -- Shutdown() empties the buffers and leaves
-@@ -1108,6 +1176,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1169,6 +1244,7 @@ RuntimeRunResult Runtime::Run() {
                   m_impl->config.record_movie.string().c_str());
    }
  
@@ -416,7 +242,7 @@ index b85977cc..3953c18b 100644
    m_impl->state_hook =
        Core::AddOnStateChangedCallback([this](Core::State state) {
          // Written on the STOPPING edge. Core.cpp's EmuThread holds a ScopeGuard
-@@ -1161,6 +1230,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1222,6 +1298,7 @@ RuntimeRunResult Runtime::Run() {
            m_impl->platform->Stop();
        });
    m_impl->reached_running = false;
@@ -424,7 +250,7 @@ index b85977cc..3953c18b 100644
    if (!BootManager::BootCore(Core::System::GetInstance(), std::move(boot),
                               m_impl->platform->GetWindowSystemInfo())) {
      m_impl->running = false;
-@@ -1169,18 +1239,23 @@ RuntimeRunResult Runtime::Run() {
+@@ -1230,18 +1307,23 @@ RuntimeRunResult Runtime::Run() {
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;
@@ -764,11 +590,117 @@ index 9d154776..48cc5c23 100644
  };
  
  struct WindowSystemInfo
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Boot/BootManager.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/Boot/BootManager.cpp
+index e1eb7151..b5f9cbd3 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Boot/BootManager.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Boot/BootManager.cpp
+@@ -16,6 +16,12 @@
+ //                                      CBoot::EmulatedBS2_Wii() / GC() or Load_BS2()
+ 
+ #include "Core/Boot/BootManager.h"
++#ifdef RINGOUT_BOOT_TRACE
++#include "native_startup.h"
++#define RINGOUT_BOOT_STAGE(x) ringout_native_stage(x)
++#else
++#define RINGOUT_BOOT_STAGE(x) ((void)0)
++#endif
+ 
+ #include <fmt/format.h>
+ 
+@@ -53,9 +59,12 @@ bool BootCore(Core::System& system, std::unique_ptr<BootParameters> boot,
+ 
+   SConfig& StartUp = SConfig::GetInstance();
+ 
++  RINGOUT_BOOT_STAGE("bootcore: set paths and metadata\n");
+   if (!StartUp.SetPathsAndGameMetadata(system, *boot))
+     return false;
++  RINGOUT_BOOT_STAGE("bootcore: metadata complete\n");
+ 
++  RINGOUT_BOOT_STAGE("bootcore: movie settings\n");
+   // Movie settings
+   auto& movie = system.GetMovie();
+   if (movie.IsPlayingInput() && movie.IsConfigSaved())
+@@ -77,6 +86,7 @@ bool BootCore(Core::System& system, std::unique_ptr<BootParameters> boot,
+     }
+   }
+ 
++  RINGOUT_BOOT_STAGE("bootcore: netplay settings\n");
+   if (NetPlay::IsNetPlayRunning())
+   {
+     const NetPlay::NetSettings* netplay_settings = boot->boot_session_data.GetNetplaySettings();
+@@ -87,6 +97,7 @@ bool BootCore(Core::System& system, std::unique_ptr<BootParameters> boot,
+     StartUp.bCopyWiiSaveNetplay = netplay_settings->savedata_load;
+   }
+ 
++  RINGOUT_BOOT_STAGE("bootcore: region settings\n");
+   // Override out-of-region languages/countries to prevent games from crashing or behaving oddly
+   if (!Config::Get(Config::MAIN_OVERRIDE_REGION_SETTINGS))
+   {
+@@ -156,10 +167,13 @@ bool BootCore(Core::System& system, std::unique_ptr<BootParameters> boot,
+     }
+   }
+ 
++  RINGOUT_BOOT_STAGE("bootcore: system initialize\n");
+   system.Initialize();
+ 
++  RINGOUT_BOOT_STAGE("bootcore: determinism\n");
+   Core::UpdateWantDeterminism(system, /*initial*/ true);
+ 
++  RINGOUT_BOOT_STAGE("bootcore: sysconf transfer\n");
+   ConfigLoaders::TransferSYSCONFControlToGuest();
+ 
+   if (system.IsWii())
+@@ -183,8 +197,10 @@ bool BootCore(Core::System& system, std::unique_ptr<BootParameters> boot,
+     }
+   }
+ 
++  RINGOUT_BOOT_STAGE("bootcore: achievements close\n");
+   AchievementManager::GetInstance().CloseGame();
+ 
++  RINGOUT_BOOT_STAGE("bootcore: choose startup\n");
+   const bool load_ipl = !system.IsWii() && !Config::Get(Config::MAIN_SKIP_IPL) &&
+                         std::holds_alternative<BootParameters::Disc>(boot->parameters);
+   if (load_ipl)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Boot/BootParameters.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/Boot/BootParameters.cpp
+index 787ef060..17030586 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Boot/BootParameters.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Boot/BootParameters.cpp
+@@ -2,6 +2,12 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "Core/Boot/Boot.h"
++#ifdef RINGOUT_BOOT_TRACE
++#include "native_startup.h"
++#define RINGOUT_BOOT_STAGE(x) ringout_native_stage(x)
++#else
++#define RINGOUT_BOOT_STAGE(x) ((void)0)
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -177,6 +183,7 @@ std::unique_ptr<BootParameters> BootParameters::GenerateFromFile(std::vector<std
+ 
+   // Check if the file exist, we may have gotten it from a --elf command line
+   // that gave an incorrect file name
++  RINGOUT_BOOT_STAGE("bootparams: check path\n");
+   if (!File::Exists(paths.front()))
+   {
+     PanicAlertFmtT("The specified file \"{0}\" does not exist", paths.front());
+@@ -219,7 +226,9 @@ std::unique_ptr<BootParameters> BootParameters::GenerateFromFile(std::vector<std
+        ".elf"}};
+   if (disc_image_extensions.contains(extension))
+   {
++    RINGOUT_BOOT_STAGE("bootparams: create disc\n");
+     std::unique_ptr<DiscIO::VolumeDisc> disc = DiscIO::CreateDiscForCore(path);
++    RINGOUT_BOOT_STAGE("bootparams: disc creation returned\n");
+     if (disc)
+     {
+       return std::make_unique<BootParameters>(Disc{std::move(path), std::move(disc), paths},
 diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/CMakeLists.txt b/ModernGekko/vendor/dolphin/Source/Core/Core/CMakeLists.txt
-index 6491d81d..f1ae4850 100644
+index 0fd4adc7..d7e98144 100644
 --- a/ModernGekko/vendor/dolphin/Source/Core/Core/CMakeLists.txt
 +++ b/ModernGekko/vendor/dolphin/Source/Core/Core/CMakeLists.txt
-@@ -931,6 +931,10 @@ if(UNIX)
+@@ -935,6 +935,10 @@ if(UNIX)
    )
  endif()
  
@@ -779,6 +711,100 @@ index 6491d81d..f1ae4850 100644
  if(TARGET cpp-ipc::ipc)
    target_sources(core PRIVATE HW/EXI/BBA/IPC.cpp)
    target_link_libraries(core PRIVATE cpp-ipc::ipc)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Core.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/Core.cpp
+index 3e52d279..5c11c581 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Core.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Core.cpp
+@@ -2,6 +2,12 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "Core/Core.h"
++#ifdef RINGOUT_BOOT_TRACE
++#include "native_startup.h"
++#define RINGOUT_BOOT_STAGE(x) ringout_native_stage(x)
++#else
++#define RINGOUT_BOOT_STAGE(x) ((void)0)
++#endif
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -212,6 +218,7 @@ bool WantsDeterminism()
+ // BootManager.cpp
+ bool Init(Core::System& system, std::unique_ptr<BootParameters> boot, const WindowSystemInfo& wsi)
+ {
++  RINGOUT_BOOT_STAGE("core: init enter\n");
+   std::lock_guard lock(s_core_mutex);
+ 
+   if (s_emu_thread.joinable())
+@@ -233,15 +240,19 @@ bool Init(Core::System& system, std::unique_ptr<BootParameters> boot, const Wind
+   INFO_LOG_FMT(BOOT, "CPU Thread separate = {}", system.IsDualCoreMode() ? "Yes" : "No");
+ 
+   // Manually reactivate the video backend in case a GameINI overrides the video backend setting.
++  RINGOUT_BOOT_STAGE("core: populate backend\n");
+   VideoBackendBase::PopulateBackendInfo(wsi);
+ 
+   // Issue any API calls which must occur on the main thread for the graphics backend.
+   WindowSystemInfo prepared_wsi(wsi);
++  RINGOUT_BOOT_STAGE("core: prepare window\n");
+   g_video_backend->PrepareWindow(prepared_wsi);
+ 
+   // Start the emu thread
+   s_state.store(State::Starting);
++  RINGOUT_BOOT_STAGE("core: start emulation thread\n");
+   s_emu_thread = std::thread(EmuThread, std::ref(system), std::move(boot), prepared_wsi);
++  RINGOUT_BOOT_STAGE("core: emulation thread started\n");
+   return true;
+ }
+ 
+@@ -522,6 +533,7 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+   }};
+ 
+   Common::SetCurrentThreadName("Emuthread - Starting");
++  RINGOUT_BOOT_STAGE("emu: thread enter\n");
+ 
+   // This will become the CPU thread.
+   DeclareAsCPUThread();
+@@ -574,9 +586,11 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+   system.GetMovie().Init(*boot);
+   Common::ScopeGuard movie_guard([&system] { system.GetMovie().Shutdown(); });
+ 
++  RINGOUT_BOOT_STAGE("emu: initialize audio\n");
+   AudioCommon::InitSoundStream(system);
+   Common::ScopeGuard audio_guard([&system] { AudioCommon::ShutdownSoundStream(system); });
+ 
++  RINGOUT_BOOT_STAGE("emu: initialize hardware\n");
+   HW::Init(system,
+            NetPlay::IsNetPlayRunning() ? &(boot_session_data.GetNetplaySettings()->sram) : nullptr);
+ 
+@@ -598,7 +612,9 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+ 
+   // In single-core mode: This holds a video backend shutdown function.
+   // In dual-core mode: This holds a GPU thread stopping function (which does the backend shutdown).
++  RINGOUT_BOOT_STAGE("emu: initialize video\n");
+   const auto video_guard = GetInitializedVideoGuard(system, wsi);
++  RINGOUT_BOOT_STAGE(video_guard ? "emu: video initialized\n" : "emu: video initialization failed\n");
+   if (!video_guard)
+   {
+     PanicAlertFmt("Failed to initialize video backend!");
+@@ -619,6 +635,7 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+   // The configured value now stands. It is set explicitly in
+   // DolphinRuntime::ApplyConfiguration, so it is identical on every machine.
+ 
++  RINGOUT_BOOT_STAGE("emu: initialize DSP\n");
+   if (!system.GetDSP().GetDSPEmulator()->Initialize(system.IsWii(),
+                                                     Config::Get(Config::MAIN_DSP_THREAD)))
+   {
+@@ -645,8 +662,10 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+   {
+     ASSERT(IsCPUThread());
+     CPUThreadGuard guard(system);
++    RINGOUT_BOOT_STAGE("emu: boot game\n");
+     if (!CBoot::BootUp(system, guard, std::move(boot)))
+       return;
++    RINGOUT_BOOT_STAGE("emu: game boot initialized\n");
+   }
+ 
+   // Initialise Wii filesystem contents.
 diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/IOS/Network/IP/Top.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/IOS/Network/IP/Top.cpp
 index a75be0f8..f7a54b02 100644
 --- a/ModernGekko/vendor/dolphin/Source/Core/Core/IOS/Network/IP/Top.cpp
@@ -795,6 +821,44 @@ index a75be0f8..f7a54b02 100644
      if (!Core::WantsDeterminism())
      {
        if (res_init() == 0)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp b/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp
+index 57787368..62e8612c 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp
+@@ -2,6 +2,12 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "DiscIO/DirectoryBlob.h"
++#ifdef RINGOUT_BOOT_TRACE
++#include "native_startup.h"
++#define RINGOUT_BOOT_STAGE(x) ringout_native_stage(x)
++#else
++#define RINGOUT_BOOT_STAGE(x) ((void)0)
++#endif
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -841,16 +847,20 @@ DirectoryBlobPartition::DirectoryBlobPartition(std::string root_directory,
+                                                std::optional<bool> is_wii)
+     : m_root_directory(std::move(root_directory))
+ {
++  RINGOUT_BOOT_STAGE("disc: read boot header\n");
+   std::vector<u8> disc_header(DISCHEADER_SIZE);
+   if (ReadFileToVector(m_root_directory + "sys/boot.bin", &disc_header) < 0x20)
+     ERROR_LOG_FMT(DISCIO, "{} doesn't exist or is too small", m_root_directory + "sys/boot.bin");
+ 
++  RINGOUT_BOOT_STAGE("disc: build system files\n");
+   SetDiscType(is_wii, disc_header);
+   SetBI2FromFile(m_root_directory + "sys/bi2.bin");
+   const u64 dol_address = SetApploaderFromFile(m_root_directory + "sys/apploader.img");
+   const u64 fst_address =
+       SetDOLFromFile(m_root_directory + "sys/main.dol", dol_address, &disc_header);
++  RINGOUT_BOOT_STAGE("disc: scan files and build FST\n");
+   BuildFSTFromFolder(m_root_directory + "files/", fst_address, &disc_header);
++  RINGOUT_BOOT_STAGE("disc: FST built\n");
+ 
+   m_contents.Add(DISCHEADER_ADDRESS, disc_header);
+ }
 diff --git a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h
 index 5b0729a9..be6608b7 100644
 --- a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h
