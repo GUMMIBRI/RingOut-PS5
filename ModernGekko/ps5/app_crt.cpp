@@ -20,6 +20,8 @@ extern "C"
     int atexit(Destructor callback);
     int sceSystemServiceLoadExec(const char *path, const char **arguments);
     int sceKernelUsleep(std::uint32_t microseconds);
+    int sceKernelSendNotificationRequest(std::uint32_t device, void *request,
+                                         std::size_t size, int blocking);
     int application_main(int argc, char **argv, char **envp) __asm__("main");
 
     extern Initializer __preinit_array_start[] __attribute__((weak));
@@ -94,6 +96,19 @@ _start(void *process_parameters, Destructor loader_teardown)
     ringout_native_stage("before main\n");
     const int status = application_main(argc, argv, nullptr);
     ringout_native_value("main returned ", static_cast<unsigned>(status));
+    if (status != 0)
+    {
+        // Notification request layout follows PSXS5's plat_notify implementation.
+        static struct
+        {
+            std::uint8_t reserved[45];
+            char message[3075];
+        } notification = {{}, "RingOut could not start. Check the startup log."};
+        const int notify_result = sceKernelSendNotificationRequest(0, &notification,
+                                                                   sizeof(notification), 0);
+        ringout_native_value("failure notification rc_u32 ",
+                             static_cast<std::uint32_t>(notify_result));
+    }
     catchReturnFromMain(status);
     // main has unwound its application-owned objects. Keep the registered
     // finalizers and loader_teardown under runtime ownership: invoking them
