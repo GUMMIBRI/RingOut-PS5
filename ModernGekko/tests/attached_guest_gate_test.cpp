@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "moderngekko/runtime.hpp"
+#include "Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h"
 #include <cstdint>
 
 int main()
@@ -15,6 +16,10 @@ int main()
   source.attached_gate_armed = &armed;
   if (source.GuestGateGroups(&dynamic_groups) != 0) return 3;
   source.attached_gate_bypass = &bypass;
+  auto cpu_source = StaticRecompModuleSource::Attached(nullptr, &armed, &bypass);
+  if (cpu_source.gate_armed != &armed || cpu_source.gate_bypass != &bypass) return 7;
+  auto legacy_cpu_source = StaticRecompModuleSource::Attached(nullptr);
+  if (legacy_cpu_source.gate_armed || legacy_cpu_source.gate_bypass) return 8;
   if (source.GuestGateGroups(&dynamic_groups) != 2) return 3;
   source.attached_gate_groups = 6;
   if (source.GuestGateGroups(nullptr) != 6) return 4;
