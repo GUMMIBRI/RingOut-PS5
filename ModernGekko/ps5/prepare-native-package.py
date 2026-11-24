@@ -1,5 +1,10 @@
-import hashlib, importlib.util, json, os, pathlib, subprocess, shutil, sys
-root = pathlib.Path(sys.argv[1]).absolute()
+import argparse, hashlib, importlib.util, json, os, pathlib, subprocess, shutil, sys
+from guest_package import guest_files
+parser=argparse.ArgumentParser()
+parser.add_argument('stage')
+parser.add_argument('--guest-dir')
+args=parser.parse_args()
+root = pathlib.Path(args.stage).absolute()
 workspace = pathlib.Path(__file__).resolve().parents[3]
 app = root / 'app/PPSA99875'
 app.mkdir(parents=True, exist_ok=True)
@@ -37,8 +42,22 @@ readme.write_text('RingOut (dev), development, private local test candidate.\n'
     'POSIX subprocess/symlink/hardlink operations report ENOSYS. pathconf uses kernel descriptor query.\n'
     'Private baseline copies; do not redistribute.\n')
 inventory.extend([{**art(p), 'bytes':p.stat().st_size} for p in [eboot,param,readme]])
+if args.guest_dir:
+    guest=pathlib.Path(args.guest_dir).resolve()
+    sources=guest_files(guest,app/'game/files/root.olk')
+    target=app/'game/guests'; target.mkdir(parents=True,exist_ok=False)
+    for src in sources:
+        dst=target/src.name
+        try: os.link(src,dst)
+        except OSError: shutil.copyfile(src,dst)
+        if sha(src)!=sha(dst):raise ValueError('guest file changed during packaging: '+src.name)
+        inventory.append({**art(dst),'bytes':dst.stat().st_size})
+    readme.write_text(readme.read_text()+'Private guest archive included; both source games remain required for local preparation.\n')
+    inventory=[{**art(p),'bytes':p.stat().st_size} if p==readme else item
+               for item in inventory for p in [pathlib.Path(item['path'])]]
 (root/'CONTENT.json').write_text(json.dumps({'app_root':str(app),'all_hashes_verified':True,
-    'private':True,'copied_immutable_assets':True,'files':inventory},indent=2))
+    'private':True,'copied_immutable_assets':True,'guest_source':str(guest) if args.guest_dir else None,
+    'files':inventory},indent=2))
 print('assembled',len(inventory),'files')
 finalizer=pathlib.Path('C:/SC2/tools/ps5_finalize_payload.py')
 spec=importlib.util.spec_from_file_location('finalizer',finalizer)

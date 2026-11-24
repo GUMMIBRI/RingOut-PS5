@@ -11,6 +11,7 @@ parser=argparse.ArgumentParser()
 parser.add_argument('--stage',required=True)
 parser.add_argument('--build-id',required=True)
 parser.add_argument('--host-build',help='fresh source-matched host build with attestation')
+parser.add_argument('--guest-dir',help='private, locally converted guests directory')
 parser.add_argument('--rollback',required=True,help='previous complete staged candidate directory')
 parser.add_argument('--include-ps5-menu',action='store_true')
 parser.add_argument('--trace-boot',action='store_true')
@@ -33,7 +34,7 @@ if not pwsh:parser.error('PowerShell 7 is required')
 llvm=sdkroot/'deps/llvm/bin'; sdk=sdkroot/'deps/ps5-payload-sdk'
 plan=[
  [sys.executable,str(here/'build-native.py'),'--stage',str(stage),'--build-id',args.build_id]+(['--host-build',args.host_build] if args.host_build else [])+(['--include-ps5-menu'] if args.include_ps5_menu else [])+(['--trace-boot'] if args.trace_boot else [])+(['--use-title-heap'] if args.use_title_heap else []),
- [sys.executable,str(here/'prepare-native-package.py'),str(stage)],
+ [sys.executable,str(here/'prepare-native-package.py'),str(stage)]+(['--guest-dir',args.guest_dir] if args.guest_dir else []),
  [pwsh,'-NoProfile','-File',str(sdkroot/'native-candidates/recipe/audit-application-imports.ps1'),'-Elf',str(stage/'ringout-native.elf'),'-StubDirectory',str(sdk/'target/lib'),'-ReadElf',str(llvm/'llvm-readelf.exe'),'-Output',str(stage/'imports-native.json')],
  [pwsh,'-NoProfile','-File',str(workspace/'aot-work/native-audit-tools/audit-application-runtime.ps1'),'-Elf',str(stage/'ringout-native.elf'),'-ImportAudit',str(stage/'imports-native.json'),'-LlvmBin',str(llvm),'-Output',str(stage/'runtime-native.json')],
  [sys.executable,str(here/'qualify-native-package.py'),str(stage),str(rollback)] ]
@@ -46,7 +47,7 @@ tmp.mkdir(parents=True); env=os.environ.copy();env.update(TEMP=str(tmp),TMP=str(
 records=[]
 def digest(p):
  with p.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
-inputs=[here/x for x in ('build-package.py','build-native.py','prepare-native-package.py','qualify-native-package.py')]
+inputs=[here/x for x in ('build-package.py','build-native.py','prepare-native-package.py','qualify-native-package.py','guest_package.py')]
 inputs += [sdkroot/'native-candidates/recipe/audit-application-imports.ps1',
            workspace/'aot-work/native-audit-tools/audit-application-runtime.ps1',
            workspace/'aot-work/native-audit-tools/scan-inline-syscalls.py',
@@ -56,6 +57,10 @@ inputs += [sdkroot/'native-candidates/recipe/audit-application-imports.ps1',
            pathlib.Path('C:/Users/gumbreezy/.codex/skills/ps5-build-package/scripts/brand_channel.py'),
            llvm/'llvm-readelf.exe',llvm/'llvm-nm.exe',llvm/'llvm-objdump.exe',
            rollback/'eboot.bin',rollback/'app/PPSA99875/sce_sys/param.json']
+if args.guest_dir:
+ guest=pathlib.Path(args.guest_dir).resolve()
+ inputs += [guest/'guests.json',guest/'root-guests.olk']
+ inputs += [guest/name for name in ('intro-spawn.sfd','intro-heihachi.sfd') if (guest/name).is_file()]
 initial={str(p):digest(p) for p in inputs}
 for command in plan:
  r=subprocess.run(command,cwd=workspace,env=env,capture_output=True,text=True)
