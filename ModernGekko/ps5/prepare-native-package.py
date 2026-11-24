@@ -3,6 +3,7 @@ from guest_package import guest_files
 parser=argparse.ArgumentParser()
 parser.add_argument('stage')
 parser.add_argument('--guest-dir')
+parser.add_argument('--asset-source')
 args=parser.parse_args()
 root = pathlib.Path(args.stage).absolute()
 workspace = pathlib.Path(__file__).resolve().parents[3]
@@ -12,6 +13,13 @@ def sha(p):
     with pathlib.Path(p).open('rb') as f: return hashlib.file_digest(f, 'sha256').hexdigest()
 def art(p): return {'path': str(p), 'sha256': sha(p)}
 baseline = json.loads((workspace / 'aot-work/FIRST-BOOT-R1-COMPLETE-MANIFEST.json').read_text())
+if args.asset_source:
+    asset_source=pathlib.Path(args.asset_source).resolve()
+    if asset_source.name != 'PPSA99875' or asset_source.parent.name != 'app':
+        raise ValueError('asset source must be a qualified PPSA99875 app folder')
+    check=json.loads((asset_source.parents[1]/'PACKAGE-CHECK.json').read_text())
+    if check.get('status') != 'STATIC_PACKAGE_PASS':
+        raise ValueError('asset source has not passed package qualification')
 inventory=[]
 for item in baseline['files']:
     relative=pathlib.PurePosixPath(item['path'])
@@ -19,9 +27,14 @@ for item in baseline['files']:
     if item['path'] in ['eboot.bin', 'sce_sys/param.json', 'README.txt']: continue
     destination=app / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
-    # Hard links retain the full immutable private content without a second 1.4 GB copy.
-    # Never edit these links or use this private development folder as a public release.
-    if not destination.exists(): shutil.copyfile(item['source'], destination)
+    # An explicitly selected, already-qualified app can provide immutable
+    # baseline assets without another full copy. Never edit either linked file.
+    source=(pathlib.Path(args.asset_source).resolve()/relative) if args.asset_source else pathlib.Path(item['source'])
+    if source.is_symlink() or not source.is_file() or sha(source)!=item['sha256']:
+        raise ValueError('baseline asset mismatch: '+item['path'])
+    if not destination.exists():
+        if args.asset_source: os.link(source,destination)
+        else: shutil.copyfile(source,destination)
     assert sha(destination)==item['sha256'], item['path']
     inventory.append({**art(destination), 'bytes':destination.stat().st_size})
 eboot=app/'eboot.bin'
@@ -56,7 +69,9 @@ if args.guest_dir:
     inventory=[{**art(p),'bytes':p.stat().st_size} if p==readme else item
                for item in inventory for p in [pathlib.Path(item['path'])]]
 (root/'CONTENT.json').write_text(json.dumps({'app_root':str(app),'all_hashes_verified':True,
-    'private':True,'copied_immutable_assets':True,'guest_source':str(guest) if args.guest_dir else None,
+    'private':True,'copied_immutable_assets':not bool(args.asset_source),
+    'asset_source':str(pathlib.Path(args.asset_source).resolve()) if args.asset_source else None,
+    'guest_source':str(guest) if args.guest_dir else None,
     'files':inventory},indent=2))
 print('assembled',len(inventory),'files')
 finalizer=pathlib.Path('C:/SC2/tools/ps5_finalize_payload.py')

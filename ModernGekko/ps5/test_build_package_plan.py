@@ -49,4 +49,11 @@ class RecipePlanTest(unittest.TestCase):
    (host/'BUILD-ATTESTATION.json').write_text(json.dumps(attestation))
    stage=pathlib.Path(t)/'stage';result=subprocess.run([sys.executable,str(script),'--stage',str(stage),'--build-id','x','--host-build',str(host)],capture_output=True,text=True)
    self.assertNotEqual(result.returncode,0);self.assertIn('game module hash differs',result.stderr);self.assertFalse(stage.exists())
+ def test_dry_run_keeps_private_source_arguments(self):
+  with tempfile.TemporaryDirectory(prefix='ringout-guest-plan-') as t:
+   cmd=[sys.executable,str(SCRIPT),'--stage',str(pathlib.Path(t)/'stage'),'--build-id','x',
+        '--rollback',str(ROLLBACK),'--host-build',str(pathlib.Path(t)/'host'),
+        '--guest-dir',str(pathlib.Path(t)/'guests'),'--asset-source',str(pathlib.Path(t)/'app'),'--dry-run']
+   plan=json.loads(subprocess.run(cmd,capture_output=True,text=True,check=True).stdout)['plan']
+   self.assertIn('--host-build',plan[0]);self.assertIn('--guest-dir',plan[1]);self.assertIn('--asset-source',plan[1])
 if __name__=='__main__':unittest.main()

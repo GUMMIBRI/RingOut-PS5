@@ -60,6 +60,8 @@ if receipt.get('host_attestation'):
     manifest['recipe']['files'].append(receipt['host_attestation'])
 if content.get('guest_source'):
     manifest['recipe']['argv'].extend(['--guest-dir', content['guest_source']])
+if content.get('asset_source'):
+    manifest['recipe']['argv'].extend(['--asset-source', content['asset_source']])
 if receipt.get('include_ps5_menu'):
     manifest['recipe']['argv'].append('--include-ps5-menu')
 if receipt.get('trace_boot'):
