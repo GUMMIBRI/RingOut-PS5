@@ -5,6 +5,7 @@
 extern "C" {
 #include "startup_log.h"
 const ModernGekkoModuleDesc* staticrecomp_get_module(void);
+extern const unsigned int staticrecomp_gate_groups __attribute__((weak));
 }
 
 #include <exception>
@@ -53,7 +54,8 @@ int main(int argc, char** argv)
         config.game_root = game_directory;
         config.user_directory = user_directory;
         ringout_log_write(&log, "Attaching recompiled game module\n");
-        config.module = moderngekko::ModuleSource::AttachedDescriptor(staticrecomp_get_module());
+        const unsigned int gate_groups = &staticrecomp_gate_groups ? staticrecomp_gate_groups : 0u;
+        config.module = moderngekko::ModuleSource::AttachedDescriptor(staticrecomp_get_module(), gate_groups);
         config.graphics.backend = "Vulkan";
         // Leave the optional scale unset so Dolphin loads the saved setting;
         // its own default is 1x when the user has not chosen a scale.

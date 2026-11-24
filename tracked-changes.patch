@@ -1,5 +1,5 @@
 diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
-index 8210d226..1cc88d78 100644
+index 8210d226..3a72845a 100644
 --- a/ModernGekko/CMakeLists.txt
 +++ b/ModernGekko/CMakeLists.txt
 @@ -56,6 +56,16 @@ option(MODERNGEKKO_ENABLE_DYNAMIC_MODULES
@@ -35,7 +35,19 @@ index 8210d226..1cc88d78 100644
      set(ENABLE_EGL OFF CACHE BOOL "" FORCE)
      # Vendored by default, as every other dependency here is: the shipped
      # builds must not vary with whatever SDL a build machine happens to have.
-@@ -359,6 +376,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -192,6 +209,11 @@ if(BUILD_TESTING)
+     target_compile_features(moderngekko_guest_test PRIVATE cxx_std_17)
+     add_test(NAME moderngekko.guest COMMAND moderngekko_guest_test)
+ 
++    add_executable(moderngekko_attached_guest_gate_test tests/attached_guest_gate_test.cpp)
++    target_include_directories(moderngekko_attached_guest_gate_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
++    target_compile_features(moderngekko_attached_guest_gate_test PRIVATE cxx_std_17)
++    add_test(NAME moderngekko.attached_guest_gates COMMAND moderngekko_attached_guest_gate_test)
++
+     add_subdirectory("${_moderngekko_dolrecomp}" dolrecomp-build)
+ else()
+     add_subdirectory("${_moderngekko_dolrecomp}" dolrecomp-build EXCLUDE_FROM_ALL)
+@@ -359,6 +381,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
          target_compile_definitions(moderngekko PRIVATE _M_GENERIC=1)
      endif()
      target_link_libraries(moderngekko PRIVATE core uicommon)
@@ -50,8 +62,46 @@ index 8210d226..1cc88d78 100644
      if(TARGET PkgConfig::X11)
          target_sources(moderngekko PRIVATE
              vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp)
+diff --git a/ModernGekko/include/moderngekko/runtime.hpp b/ModernGekko/include/moderngekko/runtime.hpp
+index 74ea9b1b..2928c439 100644
+--- a/ModernGekko/include/moderngekko/runtime.hpp
++++ b/ModernGekko/include/moderngekko/runtime.hpp
+@@ -4,6 +4,7 @@
+ #include "moderngekko/module_abi.h"
+ 
+ #include <filesystem>
++#include <cstdint>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -20,11 +21,24 @@ struct ModuleSource
+   };
+ 
+   static ModuleSource DynamicPath(std::filesystem::path path);
+-  static ModuleSource AttachedDescriptor(const ModernGekkoModuleDesc* descriptor);
++  static ModuleSource AttachedDescriptor(const ModernGekkoModuleDesc* descriptor,
++                                         std::uint32_t gate_groups = 0);
+ 
+   Kind kind = Kind::None;
+   std::filesystem::path path;
+   const ModernGekkoModuleDesc* descriptor = nullptr;
++  std::uint32_t attached_gate_groups = 0;
++
++  // An attached module has no dynamic library from which to query exports.
++  // Missing metadata must leave guest code sites disabled.
++  std::uint32_t GuestGateGroups(const std::uint32_t* dynamic_export) const
++  {
++    if (kind == Kind::AttachedDescriptor)
++      return attached_gate_groups;
++    if (kind == Kind::DynamicPath && dynamic_export)
++      return *dynamic_export;
++    return 0;
++  }
+ };
+ 
+ struct GraphicsSettings
 diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
-index c94c8751..60bf412d 100644
+index c94c8751..c9312420 100644
 --- a/ModernGekko/src/runtime/dolphin_runtime.cpp
 +++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
 @@ -3,6 +3,11 @@
@@ -66,7 +116,18 @@ index c94c8751..60bf412d 100644
  #include "VideoCommon/VideoBackendBase.h"
  
  #include "Common/MsgHandler.h"
-@@ -207,6 +212,42 @@ ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
+@@ -199,14 +204,52 @@ ModuleSource ModuleSource::DynamicPath(std::filesystem::path path) {
+ }
+ 
+ ModuleSource
+-ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor) {
++ModuleSource::AttachedDescriptor(const ModernGekkoModuleDesc *descriptor,
++                                 std::uint32_t gate_groups) {
+   ModuleSource source;
+   source.kind = Kind::AttachedDescriptor;
+   source.descriptor = descriptor;
++  source.attached_gate_groups = gate_groups;
+   return source;
  }
  
  namespace {
@@ -109,7 +170,20 @@ index c94c8751..60bf412d 100644
  // A pad profile names its device as a string ("SDL/0/Steam Deck Controller").
  // That string is not stable: on a Steam Deck the same physical pad enumerates as
  // "SDL/0/Steam Deck Controller" or "SDL/0/Steam Virtual Gamepad" depending on
-@@ -473,13 +514,17 @@ your game data has been modified and what that does to netplay.
+@@ -417,9 +460,9 @@ std::optional<RuntimeError> ResolveModuleSource(RuntimeConfig &config,
+   }
+   // The guests' code sites exist only in a module built by setup.sh --spawn/--heihachi (gate group 1).
+   {
+-    const auto* groups =
+-        static_cast<const std::uint32_t*>(validation_library.GetSymbol("staticrecomp_gate_groups"));
+-    RecompGuest::SetModuleGateGroups(groups ? *groups : 0u);
++    const auto* exported = static_cast<const std::uint32_t*>(
++        validation_library.GetSymbol("staticrecomp_gate_groups"));
++    RecompGuest::SetModuleGateGroups(config.module.GuestGateGroups(exported));
+   }
+   validation_library.Close();
+   return {};
+@@ -473,13 +516,17 @@ your game data has been modified and what that does to netplay.
  }
  
  void InitializeUICommon(const std::filesystem::path &user_directory) {
@@ -127,7 +201,7 @@ index c94c8751..60bf412d 100644
    UICommon::Init();
    // Dolphin's default non-Windows alert handler answers "No" to every
    // question, and ASSERT's PanicYesNo treats "No" as "don't ignore" ->
-@@ -489,6 +534,13 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
+@@ -489,6 +536,13 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
    Common::RegisterMsgAlertHandler([](const char *caption, const char *text,
                                       bool yes_no, Common::MsgType style) -> bool {
      std::fprintf(stderr, "[alert] %s: %s\n", caption, text);
@@ -141,7 +215,7 @@ index c94c8751..60bf412d 100644
      return true;
    });
  }
-@@ -496,6 +548,9 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
+@@ -496,6 +550,9 @@ void InitializeUICommon(const std::filesystem::path &user_directory) {
  std::unique_ptr<Platform> CreateHostPlatform(const RuntimeConfig &config) {
    if (config.headless)
      return Platform::CreateHeadlessPlatform();
@@ -151,7 +225,7 @@ index c94c8751..60bf412d 100644
  #ifdef _WIN32
    return Platform::CreateWin32Platform();
  #endif
-@@ -1001,10 +1056,19 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1001,10 +1058,19 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
          RuntimeError{RuntimeErrorCode::AlreadyActive,
                       "only one ModernGekko runtime may be active per process"}};
  
@@ -171,7 +245,7 @@ index c94c8751..60bf412d 100644
    if (auto error = ResolveModuleSource(config, *inspected.metadata))
      return {{}, std::move(*error)};
  
-@@ -1023,11 +1087,13 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1023,11 +1089,13 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
    // match the disc it came from? Netplay and the MODS tab both read the answer,
    // and the hash is cached against root.olk's size and mtime so this is only
    // expensive the first time and after an actual patch.
@@ -185,7 +259,7 @@ index c94c8751..60bf412d 100644
    impl->platform = CreateHostPlatform(impl->config);
    if (!impl->platform || !impl->platform->Init()) {
      if (impl->ui_initialized)
-@@ -1037,11 +1103,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1037,11 +1105,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
                           "the requested Dolphin host platform is unavailable"}};
    }
  
@@ -202,7 +276,7 @@ index c94c8751..60bf412d 100644
    ApplyCoreSettings(impl->metadata);
    ApplyGraphicsSettings(impl->config.graphics, impl->config.headless);
    ApplyAudioSettings(impl->config.audio, impl->config.headless);
-@@ -1049,6 +1120,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+@@ -1049,6 +1122,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
                    impl->config.input.background_input);
    ApplyModuleSourceToJit(impl->config.module);
  
@@ -210,7 +284,7 @@ index c94c8751..60bf412d 100644
    s_runtime_active = true;
    s_platform = impl->platform.get();
    s_window_title = impl->title;
-@@ -1075,6 +1147,7 @@ Runtime::~Runtime() {
+@@ -1075,6 +1149,7 @@ Runtime::~Runtime() {
  }
  
  RuntimeRunResult Runtime::Run() {
@@ -218,7 +292,7 @@ index c94c8751..60bf412d 100644
    if (m_impl->running.exchange(true))
      return {RuntimeExitReason::BootFailed,
              RuntimeError{RuntimeErrorCode::InvalidState,
-@@ -1087,6 +1160,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1087,6 +1162,7 @@ RuntimeRunResult Runtime::Run() {
      const char* const env = std::getenv("RINGOUT_GUESTS");
      RecompGuest::SetSession(!(env && env[0] == '0'));
    }
@@ -226,7 +300,7 @@ index c94c8751..60bf412d 100644
    std::unique_ptr<BootParameters> boot =
        TakeBootParameters(m_impl->metadata.main_dol.string());
    if (!boot) {
-@@ -1102,6 +1176,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1102,6 +1178,7 @@ RuntimeRunResult Runtime::Run() {
    // The pad plumbing already exists: SI_DeviceGCController calls
    // HandleMoviePadStatus on every poll, which plays a recorded pad back or
    // records the live one. Nothing had ever turned it on.
@@ -234,7 +308,7 @@ index c94c8751..60bf412d 100644
    auto& movie = Core::System::GetInstance().GetMovie();
    // A rebuilt session shares this process's MovieManager, and nothing clears
    // its mode when a session ends -- Shutdown() empties the buffers and leaves
-@@ -1169,6 +1244,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1169,6 +1246,7 @@ RuntimeRunResult Runtime::Run() {
                   m_impl->config.record_movie.string().c_str());
    }
  
@@ -242,7 +316,7 @@ index c94c8751..60bf412d 100644
    m_impl->state_hook =
        Core::AddOnStateChangedCallback([this](Core::State state) {
          // Written on the STOPPING edge. Core.cpp's EmuThread holds a ScopeGuard
-@@ -1222,6 +1298,7 @@ RuntimeRunResult Runtime::Run() {
+@@ -1222,6 +1300,7 @@ RuntimeRunResult Runtime::Run() {
            m_impl->platform->Stop();
        });
    m_impl->reached_running = false;
@@ -250,7 +324,7 @@ index c94c8751..60bf412d 100644
    if (!BootManager::BootCore(Core::System::GetInstance(), std::move(boot),
                               m_impl->platform->GetWindowSystemInfo())) {
      m_impl->running = false;
-@@ -1230,18 +1307,23 @@ RuntimeRunResult Runtime::Run() {
+@@ -1230,18 +1309,23 @@ RuntimeRunResult Runtime::Run() {
                           "Dolphin could not boot sys/main.dol"}};
    }
    m_impl->booted = true;
@@ -363,6 +437,40 @@ index d042cd7e..fa79dad1 100644
    fs::remove_all(root);
    if (!result || result.metadata->disc_id != "TEST01" ||
        result.metadata->game_name != "Synthetic Test Game" ||
+diff --git a/ModernGekko/tests/guest_test.cpp b/ModernGekko/tests/guest_test.cpp
+index 81eacef5..e32103a6 100644
+--- a/ModernGekko/tests/guest_test.cpp
++++ b/ModernGekko/tests/guest_test.cpp
+@@ -128,7 +128,8 @@ void ResolveOffReturnsOriginal()
+ 
+ void ResolveOnReturnsSpawnArchive()
+ {
+-  CHECK(Resolve("/g/files/root.olk", true, "/g") == "/g/guests/root-guests.olk");
++  const auto expected = (std::filesystem::absolute("/g") / "guests" / "root-guests.olk").lexically_normal().string();
++  CHECK(Resolve("/g/files/root.olk", true, "/g") == expected);
+ }
+ 
+ void ResolveOtherFilesUntouched()
+@@ -142,7 +143,8 @@ void ResolveUnderAFilesFolder()
+ {
+   // The game root itself sits under a folder called files: only its OWN files/root.olk switches.
+   const std::string g = "/srv/p/files/RingOut/game";
+-  CHECK(Resolve(g + "/files/root.olk", true, g) == g + "/guests/root-guests.olk");
++  const auto expected = (std::filesystem::absolute(g) / "guests" / "root-guests.olk").lexically_normal().string();
++  CHECK(Resolve(g + "/files/root.olk", true, g) == expected);
+   CHECK(Resolve("/srv/p/files/root.olk", true, g) == "/srv/p/files/root.olk");
+ }
+ 
+@@ -159,7 +161,8 @@ void ResolveRelativeGameRoot()
+ 
+ void ResolveNormalisesThePath()
+ {
+-  CHECK(Resolve("/g//files/./root.olk", true, "/g/") == "/g/guests/root-guests.olk");
++  const auto expected = (std::filesystem::absolute("/g") / "guests" / "root-guests.olk").lexically_normal().string();
++  CHECK(Resolve("/g//files/./root.olk", true, "/g/") == expected);
+ }
+ 
+ void PathsFollowTheGameRoot()
 diff --git a/ModernGekko/vendor/dolphin/CMakeLists.txt b/ModernGekko/vendor/dolphin/CMakeLists.txt
 index 49ae8ae1..f5408963 100644
 --- a/ModernGekko/vendor/dolphin/CMakeLists.txt
