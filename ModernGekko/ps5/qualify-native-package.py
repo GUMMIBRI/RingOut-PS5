@@ -46,15 +46,18 @@ manifest={'schema':1,'source_revision':receipt['source_revision']+' + captured l
     'rollback':{'eboot':art(pathlib.Path(sys.argv[2])/'eboot.bin'),
                 'param':art(pathlib.Path(sys.argv[2])/'app/PPSA99875/sce_sys/param.json')},
     'recipe':{'cwd':str(workspace),'argv':['python',str(snapshot/'build-native.py'),'--build-id',receipt['build_id'],'--stage','NEW_EMPTY_STAGE'],
-              'environment_notes':'Pinned native recipe uses existing GRSEAF host archives; restore captured source into original path before rebuilding. Never overwrite accepted candidates.',
+              'environment_notes':'Pinned native recipe uses the recorded host build and private GRSEAF module. Never overwrite accepted candidates.',
               'files':[art(root/'FINALIZATION.json'),art(root/'link-args.json'),art(snapshot/'build-native.py'),art(root/'commands.json')]},
     'pairing_receipt':{**art(root/'FINALIZATION.json'),'eboot_hash_field':'eboot.sha256','elf_hash_field':'elf.sha256'},
     'audits':[{**art(root/'AUDIT-CHAIN.json'),'subject':'elf','subject_hash_field':'elf.sha256',
                'covers':['imports','runtime_layout','self_integrity'],
                'assertions':[{'field':key,'equals':True} for key in ['imports_passed','runtime_layout_passed','self_integrity_passed']]}]}
 # Run recipe in its recorded source location; the snapshot is evidence, not a relocated workspace.
-manifest['recipe']['argv'][1]=str(workspace/'source/ModernGekko/ps5/build-package.py')
+manifest['recipe']['argv'][1]=str(pathlib.Path(__file__).resolve().with_name('build-package.py'))
 manifest['recipe']['argv'].extend(['--rollback', sys.argv[2]])
+if receipt.get('host_attestation'):
+    manifest['recipe']['argv'].extend(['--host-build', receipt['host_build']])
+    manifest['recipe']['files'].append(receipt['host_attestation'])
 if receipt.get('include_ps5_menu'):
     manifest['recipe']['argv'].append('--include-ps5-menu')
 if receipt.get('trace_boot'):

@@ -285,6 +285,8 @@ inspection = run([converter, 'self', '--inspect', '--file', stage / 'eboot.bin']
 (stage / 'self-inspect.txt').write_text(inspection)
 revision = run(['git', '-C', source_root, 'rev-parse', 'HEAD']).strip()
 receipt = {'build_id': args.build_id, 'source_revision': revision,
+           'host_build': str(host_build),
+           'host_attestation': record(attestation_path) if args.host_build else None,
            'include_ps5_menu': args.include_ps5_menu,
            'trace_boot': args.trace_boot,
            'use_title_heap': args.use_title_heap,
