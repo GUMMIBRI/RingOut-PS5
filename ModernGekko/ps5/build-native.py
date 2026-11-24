@@ -14,6 +14,7 @@ import subprocess
 parser = argparse.ArgumentParser()
 parser.add_argument('--stage', required=True)
 parser.add_argument('--build-id', required=True)
+parser.add_argument('--host-build', help='fresh source-matched CMake host build, with BUILD-ATTESTATION.json')
 parser.add_argument('--include-ps5-menu', action='store_true',
                     help='rebuild the PS5 host loop with the menu lifecycle integration')
 parser.add_argument('--trace-boot', action='store_true', help='rebuild Dolphin boot phase tracers')
@@ -22,14 +23,43 @@ args = parser.parse_args()
 if not args.build_id or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._' for c in args.build_id):
     parser.error('--build-id must contain only letters, digits, dash, dot or underscore')
 workspace = Path(__file__).resolve().parents[3]
-source = workspace / 'source/ModernGekko/ps5'
-if Path(__file__).resolve().parent != source.resolve():
-    parser.error('this pinned recipe uses a different source checkout and old host archives; configure and rebuild for this checkout first')
-revision = subprocess.run(['git', '-C', str(workspace / 'source'), 'rev-parse', 'HEAD'],
+source = Path(__file__).resolve().parent
+source_root = source.parents[1]
+revision = subprocess.run(['git', '-C', str(source_root), 'rev-parse', 'HEAD'],
                           capture_output=True, text=True)
-if revision.returncode or revision.stdout.strip() != '9339899231d9cf90282c7b4c17eb1cf0c3c4e14c':
-    parser.error('host archives are pinned to the older source revision; rebuild them before producing a candidate')
+if revision.returncode:
+    parser.error('cannot identify source revision')
 work = workspace / 'aot-work/ps5-aot-grseaf-r1'
+host_build = Path(args.host_build).resolve() if args.host_build else work / 'host-build-sdk'
+if args.host_build:
+    attestation_path = host_build / 'BUILD-ATTESTATION.json'
+    if not attestation_path.is_file():
+        parser.error('fresh host build requires BUILD-ATTESTATION.json')
+    attestation = json.loads(attestation_path.read_text())
+    if (attestation.get('status') != 'success' or
+        attestation.get('source_revision') != revision.stdout.strip() or
+        Path(attestation.get('source_root', '')).resolve() != source_root.resolve() or
+        hashlib.sha256((host_build / 'build.ninja').read_bytes()).hexdigest() != attestation.get('build_ninja_sha256')):
+        parser.error('host build attestation does not match source and CMake build')
+    dirty = subprocess.run(['git', '-C', str(source_root), 'status', '--porcelain', '--untracked-files=no'],
+                           capture_output=True, text=True)
+    if dirty.returncode or dirty.stdout.strip():
+        parser.error('fresh host build requires a clean tracked source checkout')
+    archives = attestation.get('archives', {})
+    if not archives:
+        parser.error('fresh host build attestation has no archive hashes')
+    for relative, expected in archives.items():
+        path = (host_build / relative).resolve()
+        if not path.is_relative_to(host_build) or not path.is_file():
+            parser.error('fresh host build archive mismatch: ' + relative)
+        with path.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+                parser.error('fresh host build archive mismatch: ' + relative)
+else:
+    if source != (workspace / 'source/ModernGekko/ps5').resolve():
+        parser.error('this pinned recipe uses a different source checkout and old host archives; configure and rebuild for this checkout first')
+    if revision.stdout.strip() != '9339899231d9cf90282c7b4c17eb1cf0c3c4e14c':
+        parser.error('host archives are pinned to the older source revision; rebuild them before producing a candidate')
 # Preserve a mapped drive: the pinned converter cannot write UNC output paths.
 stage = Path(args.stage).absolute()
 if str(stage).startswith('\\\\'):
@@ -77,7 +107,6 @@ for name in ['native_startup.h', 'startup_log.h', 'build-native.py']:
 # Rebuild the changed runtime members with their exact existing CMake recipe.
 # Work on a staged archive so frozen candidates and the original host build
 # remain reproducible. Recompiling only ps5/main.cpp misses game.cpp fixes.
-host_build = work / 'host-build-sdk'
 ninja = sdk / 'win/ninja.exe'
 def windows_argv(command):
     shell32 = ctypes.WinDLL('shell32', use_last_error=True)
@@ -236,10 +265,13 @@ if args.use_title_heap:
 (stage / 'link-args.json').write_text(json.dumps(link, indent=2))
 for entry in link:
     path = Path(entry)
-    if not path.is_absolute(): path = work / 'host-build-sdk' / path
+    if not path.is_absolute(): path = host_build / path
     if path.is_file() and path.suffix in ('.a', '.o', '.so', '.ld', '.map'):
+        if args.host_build and path.suffix == '.a' and path.resolve().is_relative_to(host_build):
+            if path.resolve().relative_to(host_build).as_posix() not in archives:
+                raise RuntimeError('linked host archive is absent from attestation: ' + str(path))
         inputs.append(record(path))
-run([llvm / 'ld.lld.exe', *link], work / 'host-build-sdk')
+run([llvm / 'ld.lld.exe', *link], host_build)
 definitions = run([llvm / 'llvm-nm.exe', '--defined-only', stage / 'ringout-native.elf'])
 assert any(line.split()[-1:] == ['vk_common_GetPhysicalDeviceProperties2']
            for line in definitions.splitlines()), 'RADV physical-device callback is missing'
@@ -251,7 +283,7 @@ run([converter, 'link', '--in', stage / 'ringout-native.elf', '--out', stage / '
 run([converter, 'self', '--sign', '--in', stage / 'eboot.elf', '--out', stage / 'eboot.bin'])
 inspection = run([converter, 'self', '--inspect', '--file', stage / 'eboot.bin'])
 (stage / 'self-inspect.txt').write_text(inspection)
-revision = run(['git', '-C', workspace / 'source', 'rev-parse', 'HEAD']).strip()
+revision = run(['git', '-C', source_root, 'rev-parse', 'HEAD']).strip()
 receipt = {'build_id': args.build_id, 'source_revision': revision,
            'include_ps5_menu': args.include_ps5_menu,
            'trace_boot': args.trace_boot,

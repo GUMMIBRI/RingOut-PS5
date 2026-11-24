@@ -23,4 +23,13 @@ class RecipePlanTest(unittest.TestCase):
   with tempfile.TemporaryDirectory(prefix='ringout-plan-') as t:
    cmd=[sys.executable,str(SCRIPT),'--stage',str(pathlib.Path(t)/'stage'),'--build-id','x','--rollback',str(pathlib.Path(t)/'missing'),'--dry-run']
    self.assertNotEqual(subprocess.run(cmd,capture_output=True).returncode,0)
+ def test_unattested_host_build_rejected_before_staging(self):
+  with tempfile.TemporaryDirectory(prefix='ringout-host-') as t:
+   stage=pathlib.Path(t)/'stage'
+   native=SCRIPT.with_name('build-native.py')
+   cmd=[sys.executable,str(native),'--stage',str(stage),'--build-id','x','--host-build',t]
+   result=subprocess.run(cmd,capture_output=True,text=True)
+   self.assertNotEqual(result.returncode,0)
+   self.assertIn('requires BUILD-ATTESTATION.json',result.stderr)
+   self.assertFalse(stage.exists())
 if __name__=='__main__':unittest.main()

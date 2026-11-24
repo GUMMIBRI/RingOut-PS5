@@ -10,13 +10,14 @@ sdkroot=pathlib.Path('C:/.pe/ps5-native/gpu-platform-20261030')
 parser=argparse.ArgumentParser()
 parser.add_argument('--stage',required=True)
 parser.add_argument('--build-id',required=True)
+parser.add_argument('--host-build',help='fresh source-matched host build with attestation')
 parser.add_argument('--rollback',required=True,help='previous complete staged candidate directory')
 parser.add_argument('--include-ps5-menu',action='store_true')
 parser.add_argument('--trace-boot',action='store_true')
 parser.add_argument('--use-title-heap',action='store_true')
 parser.add_argument('--dry-run',action='store_true')
 args=parser.parse_args()
-if here != (workspace/'source/ModernGekko/ps5').resolve():
+if not args.host_build and here != (workspace/'source/ModernGekko/ps5').resolve():
     parser.error('this pinned recipe uses a different source checkout and old host archives; configure and rebuild for this checkout first')
 stage=pathlib.Path(args.stage).absolute()
 rollback=pathlib.Path(args.rollback).absolute()
@@ -31,7 +32,7 @@ pwsh=shutil.which('pwsh')
 if not pwsh:parser.error('PowerShell 7 is required')
 llvm=sdkroot/'deps/llvm/bin'; sdk=sdkroot/'deps/ps5-payload-sdk'
 plan=[
- [sys.executable,str(here/'build-native.py'),'--stage',str(stage),'--build-id',args.build_id]+(['--include-ps5-menu'] if args.include_ps5_menu else [])+(['--trace-boot'] if args.trace_boot else [])+(['--use-title-heap'] if args.use_title_heap else []),
+ [sys.executable,str(here/'build-native.py'),'--stage',str(stage),'--build-id',args.build_id]+(['--host-build',args.host_build] if args.host_build else [])+(['--include-ps5-menu'] if args.include_ps5_menu else [])+(['--trace-boot'] if args.trace_boot else [])+(['--use-title-heap'] if args.use_title_heap else []),
  [sys.executable,str(here/'prepare-native-package.py'),str(stage)],
  [pwsh,'-NoProfile','-File',str(sdkroot/'native-candidates/recipe/audit-application-imports.ps1'),'-Elf',str(stage/'ringout-native.elf'),'-StubDirectory',str(sdk/'target/lib'),'-ReadElf',str(llvm/'llvm-readelf.exe'),'-Output',str(stage/'imports-native.json')],
  [pwsh,'-NoProfile','-File',str(workspace/'aot-work/native-audit-tools/audit-application-runtime.ps1'),'-Elf',str(stage/'ringout-native.elf'),'-ImportAudit',str(stage/'imports-native.json'),'-LlvmBin',str(llvm),'-Output',str(stage/'runtime-native.json')],
