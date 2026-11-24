@@ -1487,3 +1487,190 @@ index f95f11a6..2416793b 100644
    "${MODULE_TEMPLATE}/module_export.c"
    "${MODULE_TABLES}"
    "${DOLRECOMP_SRC}/cpu/cpu.c"
+diff --git a/tools/guests/setup_guests.py b/tools/guests/setup_guests.py
+index d0875009..5ad728de 100644
+--- a/tools/guests/setup_guests.py
++++ b/tools/guests/setup_guests.py
+@@ -83,7 +83,7 @@ def _identify(spawn_image, heihachi_image, spawn_table, heihachi_table):
+     spawn = heihachi = None
+     if spawn_image:
+         try:
+-            spawn = releases.identify(xiso.open_image(spawn_image), table=spawn_table)
++            spawn = releases.identify(xiso.open_source(spawn_image), table=spawn_table)
+         except (xiso.ImageError, releases.Refusal) as e:
+             raise _Refused(str(e))
+         except OSError as e:
+@@ -135,7 +135,7 @@ def copy_intros(out_dir, spawn_image, heihachi_image):
+ 
+     An extra, never a reason to fail: a disc without the movie, or a copy that cannot be written, leaves the
+     guests exactly as built and that intro out of the rotation. A movie already there at the right size is kept."""
+-    for image, opener, name in ((spawn_image, xiso.open_image, INTRO_SPAWN),
++    for image, opener, name in ((spawn_image, xiso.open_source, INTRO_SPAWN),
+                                 (heihachi_image, ps2iso.open_image, INTRO_HEIHACHI)):
+         if not image: continue
+         dst = os.path.join(out_dir, name)
+@@ -184,19 +184,25 @@ def run(spawn_image, heihachi_image, game, log, check_only=False, build=build, s
+     new, cur, old, old_format = (os.path.join(game, n) for n in ('guests.new', 'guests', 'guests.old', 'spawn'))
+     # utf-8: the log names the images, and a Windows code page cannot write every path.
+     with open(log, 'w', encoding='utf-8') as lf:
++        operation = 'build'
+         try:
+             os.makedirs(new)
+             with contextlib.redirect_stdout(lf):
+                 print('%s: %s %s' % (names, spawn_image or '', heihachi_image or ''), flush=True)
+                 build(new, game, spawn, heihachi)
+                 copy_intros(new, spawn_image, heihachi_image)
++            operation = 'move previous archive'
+             if os.path.isdir(cur): os.rename(cur, old)
++            operation = 'install replacement'
+             os.rename(new, cur)
+             if os.path.isdir(old): shutil.rmtree(old)
+-        except BaseException:
++        except BaseException as error:
+             traceback.print_exc(file=lf)
+             shutil.rmtree(new, ignore_errors=True)
+             if os.path.isdir(old) and not os.path.isdir(cur): os.rename(old, cur)
++            if os.name == 'nt' and operation == 'move previous archive' and isinstance(error, PermissionError):
++                print('%s could not be installed: close any program using the guest archive, then retry (details: %s)' % (names, log))
++                return FAILED
+             print('%s could not be built (details: %s)' % (names, log)); return FAILED
+     # The old install goes only now, with the new archive in place. The runtime ignores it if this is cut short.
+     if os.path.isdir(old_format): shutil.rmtree(old_format)
+@@ -206,7 +212,7 @@ def run(spawn_image, heihachi_image, game, log, check_only=False, build=build, s
+ 
+ if __name__ == '__main__':
+     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+-    ap.add_argument('--spawn'); ap.add_argument('--heihachi')
++    ap.add_argument('--spawn', help='Xbox image or extracted Xbox disc folder'); ap.add_argument('--heihachi')
+     ap.add_argument('--game', required=True); ap.add_argument('--log', required=True)
+     ap.add_argument('--check-image', action='store_true')
+     a = ap.parse_args()
+diff --git a/tools/guests/sndconv.py b/tools/guests/sndconv.py
+index 7273c6c4..fa3299e8 100644
+--- a/tools/guests/sndconv.py
++++ b/tools/guests/sndconv.py
+@@ -63,7 +63,9 @@ class DspEncoder:
+         # Each in turn: SteamOS's `cc` can be a clang with no C headers while gcc beside it works.
+         errors = []
+         for comp in comps:
+-            r = subprocess.run([comp, '-O2', '-std=c99', '-o', exe, src, '-lm'], capture_output=True, text=True)
++            # Zig is a C compiler driver with an explicit `cc` subcommand.
++            driver = [comp, 'cc'] if os.path.basename(comp).lower() in ('zig', 'zig.exe') else [comp]
++            r = subprocess.run([*driver, '-O2', '-std=c99', '-o', exe, src, '-lm'], capture_output=True, text=True)
+             if not r.returncode:
+                 break
+             errors.append(comp + ': ' + r.stderr.strip()[-300:])
+@@ -85,6 +87,7 @@ class DspEncoder:
+         import shutil
+         if self.p.poll() is None:
+             self.p.stdin.write(struct.pack('<I', 0)); self.p.stdin.close(); self.p.wait()
++        self.p.stdout.close()
+         shutil.rmtree(self.dir, ignore_errors=True)
+ 
+ 
+diff --git a/tools/guests/tests/test_setup_guests.py b/tools/guests/tests/test_setup_guests.py
+index 92796e55..68dcb1fa 100644
+--- a/tools/guests/tests/test_setup_guests.py
++++ b/tools/guests/tests/test_setup_guests.py
+@@ -210,13 +210,31 @@ class DriverTest(unittest.TestCase):
+         self.assertEqual(os.listdir(os.path.dirname(self.game)), ['game'])
+         self.assertEqual(self.run_()[0], 0)
+ 
++    def test_spawn_from_extracted_folder(self):
++        folder = os.path.join(self.d, 'extracted-xbox')
++        os.makedirs(folder)
++        for name, data in (('root.olk', XROOT), ('orig_Default.xbe', XBE)):
++            with open(os.path.join(folder, name), 'wb') as f: f.write(data)
++        self.image = folder
++        self.assertEqual(self.run_()[0], 0)
++        self.assertEqual(self.spawn(), b'NEW' * 1000)
++
+     def test_old_archive_open_during_the_swap(self):
+         self.run_(build=Fake())
+         with open(os.path.join(self.game, 'guests', 'root-guests.olk'), 'ab') as f: f.write(b'old')  # force a rebuild
+         with open(os.path.join(self.game, 'guests', 'root-guests.olk'), 'rb') as held:
++            code, message = self.run_()
++            if os.name == 'nt':
++                self.assertEqual(code, 1)
++                self.assertIn('close any program using the guest archive', message)
++                self.assertTrue(self.spawn().endswith(b'old'))
++            else:
++                self.assertEqual(code, 0)
++                self.assertEqual(self.spawn(), b'NEW' * 1000)
++            self.assertTrue(held.read().endswith(b'old'))
++        if os.name == 'nt':
+             self.assertEqual(self.run_()[0], 0)
+             self.assertEqual(self.spawn(), b'NEW' * 1000)
+-            self.assertTrue(held.read().endswith(b'old'))
+ 
+     def test_read_only_image(self):
+         os.chmod(self.image, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+diff --git a/tools/guests/tests/test_sndconv.py b/tools/guests/tests/test_sndconv.py
+index 9920481e..d5dac127 100644
+--- a/tools/guests/tests/test_sndconv.py
++++ b/tools/guests/tests/test_sndconv.py
+@@ -53,6 +53,16 @@ class MatchesNumpyTest(unittest.TestCase):
+ 
+ 
+ class CompilerTest(unittest.TestCase):
++    def test_configured_compiler_encodes_silence(self):
++        if not os.environ.get('CC'):
++            self.skipTest('no configured compiler')
++        enc = sndconv.DspEncoder()
++        try:
++            data, frames = enc.encode([0] * 14, [(0, 0)] * 8)
++            self.assertEqual((data, frames), (bytes(8), 1))
++        finally:
++            enc.close()
++
+     def test_no_compiler_message(self):
+         with mock.patch.dict(os.environ, {'PATH': '/nonexistent', 'CC': ''}):
+             with self.assertRaises(ValueError) as c:
+diff --git a/tools/spawn/tests/test_xiso.py b/tools/spawn/tests/test_xiso.py
+index f3cc3823..e6bacbf9 100644
+--- a/tools/spawn/tests/test_xiso.py
++++ b/tools/spawn/tests/test_xiso.py
+@@ -45,6 +45,14 @@ class XisoTest(unittest.TestCase):
+         v = xiso.find(xiso.open_image(self.p), 'root.olk')
+         with self.assertRaises(ValueError): v.read(v.size - 4, 8)
+ 
++    def test_extracted_folder_uses_bounded_read_only_views(self):
++        for name, data in FILES.items():
++            with open(os.path.join(self.d.name, name), 'wb') as f: f.write(data)
++        fs = xiso.open_source(self.d.name)
++        self.assertEqual(xiso.find(fs, 'ROOT.OLK').read_all(), FILES['root.olk'])
++        with self.assertRaises(ValueError): xiso.find(fs, 'Default.xbe').read(0, 999999)
++        self.assertEqual(xiso.open_source(self.d.name)['root.olk'].size, len(FILES['root.olk']))
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/tools/spawn/xiso.py b/tools/spawn/xiso.py
+index 222847a4..6faa89e9 100644
+--- a/tools/spawn/xiso.py
++++ b/tools/spawn/xiso.py
+@@ -100,3 +100,24 @@ def find(files, name):
+         if n.lower() == name.lower():
+             return v
+     return None
++
++
++def open_source(path):
++    """Read an image or the root of a user-supplied extracted Xbox disc.
++
++    Directory files retain the same bounded, read-only FileView interface. Do not
++    follow symlinks or resolve ambiguous case-insensitive filenames.
++    """
++    if not os.path.isdir(path):
++        return open_image(path)
++    files, names = {}, set()
++    with os.scandir(path) as entries:
++        for entry in entries:
++            if not entry.is_file(follow_symlinks=False):
++                continue
++            folded = entry.name.casefold()
++            if folded in names:
++                raise ImageError('ambiguous Xbox source filenames')
++            names.add(folded)
++            files[entry.name] = FileView(entry.path, 0, entry.stat(follow_symlinks=False).st_size)
++    return files
