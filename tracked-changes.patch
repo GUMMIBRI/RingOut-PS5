@@ -1371,10 +1371,26 @@ index 66d9347a..81837094 100644
    // Create a new swap chain from a pre-existing surface.
    static std::unique_ptr<SwapChain> Create(const WindowSystemInfo& wsi, VkSurfaceKHR surface,
 diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanContext.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanContext.cpp
-index 641b5421..f52b291f 100644
+index 641b5421..1a7b6ece 100644
 --- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanContext.cpp
 +++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanContext.cpp
-@@ -349,6 +349,9 @@ bool VulkanContext::SelectInstanceExtensions(std::vector<const char*>* extension
+@@ -15,6 +15,15 @@
+ #include "VideoCommon/DriverDetails.h"
+ #include "VideoCommon/VideoCommon.h"
+ 
++#ifdef RINGOUT_VULKAN_TRACE
++#include "native_startup.h"
++#define RINGOUT_VK_STAGE(x) ringout_native_stage(x)
++#define RINGOUT_VK_VALUE(label, value) ringout_native_value(label, static_cast<u32>(value))
++#else
++#define RINGOUT_VK_STAGE(x) ((void)0)
++#define RINGOUT_VK_VALUE(label, value) ((void)0)
++#endif
++
+ namespace Vulkan
+ {
+ static constexpr const char* VALIDATION_LAYER_NAME = "VK_LAYER_KHRONOS_validation";
+@@ -349,6 +358,9 @@ bool VulkanContext::SelectInstanceExtensions(std::vector<const char*>* extension
      return false;
    }
  
@@ -1384,6 +1400,92 @@ index 641b5421..f52b291f 100644
  #if defined(VK_USE_PLATFORM_WIN32_KHR)
    if (wstype == WindowSystemType::Windows &&
        !AddExtension(VK_KHR_WIN32_SURFACE_EXTENSION_NAME, true))
+@@ -603,8 +615,12 @@ std::unique_ptr<VulkanContext> VulkanContext::Create(VkInstance instance, VkPhys
+     context->EnableDebugUtils();
+ 
+   // Attempt to create the device.
+-  if (!context->CreateDevice(surface, enable_validation_layer) ||
+-      !context->CreateAllocator(vk_api_version))
++  RINGOUT_VK_STAGE("vulkan: create logical device\n");
++  const bool device_ready = context->CreateDevice(surface, enable_validation_layer);
++  RINGOUT_VK_VALUE("vulkan: logical device result ", device_ready);
++  const bool allocator_ready = device_ready && context->CreateAllocator(vk_api_version);
++  RINGOUT_VK_VALUE("vulkan: allocator result ", allocator_ready);
++  if (!device_ready || !allocator_ready)
+   {
+     // Since we are destroying the instance, we're also responsible for destroying the surface.
+     if (surface != VK_NULL_HANDLE)
+@@ -621,6 +637,8 @@ bool VulkanContext::SelectDeviceExtensions(bool enable_surface)
+   u32 extension_count = 0;
+   VkResult res =
+       vkEnumerateDeviceExtensionProperties(m_physical_device, nullptr, &extension_count, nullptr);
++  RINGOUT_VK_VALUE("vulkan: enumerate extensions VkResult u32 ", res);
++  RINGOUT_VK_VALUE("vulkan: extension count ", extension_count);
+   if (res != VK_SUCCESS)
+   {
+     LOG_VULKAN_ERROR(res, "vkEnumerateDeviceExtensionProperties failed: ");
+@@ -696,6 +714,7 @@ bool VulkanContext::CreateDevice(VkSurfaceKHR surface, bool enable_validation_la
+ {
+   u32 queue_family_count;
+   vkGetPhysicalDeviceQueueFamilyProperties(m_physical_device, &queue_family_count, nullptr);
++  RINGOUT_VK_VALUE("vulkan: queue family count ", queue_family_count);
+   if (queue_family_count == 0)
+   {
+     ERROR_LOG_FMT(VIDEO, "No queue families found on specified vulkan physical device.");
+@@ -725,9 +744,11 @@ bool VulkanContext::CreateDevice(VkSurfaceKHR surface, bool enable_validation_la
+ 
+     if (surface)
+     {
+-      VkBool32 present_supported;
++      VkBool32 present_supported = VK_FALSE;
+       VkResult res =
+           vkGetPhysicalDeviceSurfaceSupportKHR(m_physical_device, i, surface, &present_supported);
++      RINGOUT_VK_VALUE("vulkan: surface support VkResult u32 ", res);
++      RINGOUT_VK_VALUE("vulkan: surface supported ", present_supported);
+       if (res != VK_SUCCESS)
+       {
+         LOG_VULKAN_ERROR(res, "vkGetPhysicalDeviceSurfaceSupportKHR failed: ");
+@@ -792,8 +813,13 @@ bool VulkanContext::CreateDevice(VkSurfaceKHR surface, bool enable_validation_la
+   }
+   device_info.pQueueCreateInfos = queue_infos.data();
+ 
++  RINGOUT_VK_VALUE("vulkan: selected graphics queue ", m_graphics_queue_family_index);
++  RINGOUT_VK_VALUE("vulkan: selected present queue ", m_present_queue_family_index);
+   if (!SelectDeviceExtensions(surface != VK_NULL_HANDLE))
++  {
++    RINGOUT_VK_STAGE("vulkan: device extension selection failed\n");
+     return false;
++  }
+ 
+   // convert std::string list to a char pointer list which we can feed in
+   std::vector<const char*> extension_name_pointers;
+@@ -818,6 +844,7 @@ bool VulkanContext::CreateDevice(VkSurfaceKHR surface, bool enable_validation_la
+   }
+ 
+   VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
++  RINGOUT_VK_VALUE("vulkan: vkCreateDevice VkResult u32 ", res);
+   if (res != VK_SUCCESS)
+   {
+     LOG_VULKAN_ERROR(res, "vkCreateDevice failed: ");
+@@ -826,7 +853,10 @@ bool VulkanContext::CreateDevice(VkSurfaceKHR surface, bool enable_validation_la
+ 
+   // With the device created, we can fill the remaining entry points.
+   if (!LoadVulkanDeviceFunctions(m_device))
++  {
++    RINGOUT_VK_STAGE("vulkan: device function loading failed\n");
+     return false;
++  }
+ 
+   // Grab the graphics and present queues.
+   vkGetDeviceQueue(m_device, m_graphics_queue_family_index, 0, &m_graphics_queue);
+@@ -856,6 +886,7 @@ bool VulkanContext::CreateAllocator(u32 vk_api_version)
+     allocator_info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+ 
+   VkResult res = vmaCreateAllocator(&allocator_info, &m_allocator);
++  RINGOUT_VK_VALUE("vulkan: vmaCreateAllocator VkResult u32 ", res);
+   if (res != VK_SUCCESS)
+   {
+     LOG_VULKAN_ERROR(res, "vmaCreateAllocator failed: ");
 diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanEntryPoints.inl b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanEntryPoints.inl
 index c262a345..0921456b 100644
 --- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanEntryPoints.inl

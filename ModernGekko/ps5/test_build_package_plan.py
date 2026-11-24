@@ -53,7 +53,7 @@ class RecipePlanTest(unittest.TestCase):
   with tempfile.TemporaryDirectory(prefix='ringout-guest-plan-') as t:
    cmd=[sys.executable,str(SCRIPT),'--stage',str(pathlib.Path(t)/'stage'),'--build-id','x',
         '--rollback',str(ROLLBACK),'--host-build',str(pathlib.Path(t)/'host'),
-        '--guest-dir',str(pathlib.Path(t)/'guests'),'--asset-source',str(pathlib.Path(t)/'app'),'--dry-run']
+        '--guest-dir',str(pathlib.Path(t)/'guests'),'--asset-source',str(pathlib.Path(t)/'app'),'--trace-vulkan','--dry-run']
    plan=json.loads(subprocess.run(cmd,capture_output=True,text=True,check=True).stdout)['plan']
-   self.assertIn('--host-build',plan[0]);self.assertIn('--guest-dir',plan[1]);self.assertIn('--asset-source',plan[1])
+   self.assertIn('--host-build',plan[0]);self.assertIn('--trace-vulkan',plan[0]);self.assertIn('--guest-dir',plan[1]);self.assertIn('--asset-source',plan[1])
 if __name__=='__main__':unittest.main()

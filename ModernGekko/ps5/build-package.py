@@ -16,6 +16,7 @@ parser.add_argument('--asset-source',help='qualified previous app folder whose i
 parser.add_argument('--rollback',required=True,help='previous complete staged candidate directory')
 parser.add_argument('--include-ps5-menu',action='store_true')
 parser.add_argument('--trace-boot',action='store_true')
+parser.add_argument('--trace-vulkan',action='store_true')
 parser.add_argument('--use-title-heap',action='store_true')
 parser.add_argument('--dry-run',action='store_true')
 args=parser.parse_args()
@@ -34,7 +35,7 @@ pwsh=shutil.which('pwsh')
 if not pwsh:parser.error('PowerShell 7 is required')
 llvm=sdkroot/'deps/llvm/bin'; sdk=sdkroot/'deps/ps5-payload-sdk'
 plan=[
- [sys.executable,str(here/'build-native.py'),'--stage',str(stage),'--build-id',args.build_id]+(['--host-build',args.host_build] if args.host_build else [])+(['--include-ps5-menu'] if args.include_ps5_menu else [])+(['--trace-boot'] if args.trace_boot else [])+(['--use-title-heap'] if args.use_title_heap else []),
+ [sys.executable,str(here/'build-native.py'),'--stage',str(stage),'--build-id',args.build_id]+(['--host-build',args.host_build] if args.host_build else [])+(['--include-ps5-menu'] if args.include_ps5_menu else [])+(['--trace-boot'] if args.trace_boot else [])+(['--trace-vulkan'] if args.trace_vulkan else [])+(['--use-title-heap'] if args.use_title_heap else []),
  [sys.executable,str(here/'prepare-native-package.py'),str(stage)]+(['--guest-dir',args.guest_dir] if args.guest_dir else [])+(['--asset-source',args.asset_source] if args.asset_source else []),
  [pwsh,'-NoProfile','-File',str(sdkroot/'native-candidates/recipe/audit-application-imports.ps1'),'-Elf',str(stage/'ringout-native.elf'),'-StubDirectory',str(sdk/'target/lib'),'-ReadElf',str(llvm/'llvm-readelf.exe'),'-Output',str(stage/'imports-native.json')],
  [pwsh,'-NoProfile','-File',str(workspace/'aot-work/native-audit-tools/audit-application-runtime.ps1'),'-Elf',str(stage/'ringout-native.elf'),'-ImportAudit',str(stage/'imports-native.json'),'-LlvmBin',str(llvm),'-Output',str(stage/'runtime-native.json')],

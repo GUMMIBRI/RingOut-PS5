@@ -66,6 +66,8 @@ if receipt.get('include_ps5_menu'):
     manifest['recipe']['argv'].append('--include-ps5-menu')
 if receipt.get('trace_boot'):
     manifest['recipe']['argv'].append('--trace-boot')
+if receipt.get('trace_vulkan'):
+    manifest['recipe']['argv'].append('--trace-vulkan')
 if receipt.get('use_title_heap'):
     manifest['recipe']['argv'].append('--use-title-heap')
 for dependency in manifest['dependencies']:

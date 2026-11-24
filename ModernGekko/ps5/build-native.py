@@ -18,6 +18,7 @@ parser.add_argument('--host-build', help='fresh source-matched CMake host build,
 parser.add_argument('--include-ps5-menu', action='store_true',
                     help='rebuild the PS5 host loop with the menu lifecycle integration')
 parser.add_argument('--trace-boot', action='store_true', help='rebuild Dolphin boot phase tracers')
+parser.add_argument('--trace-vulkan', action='store_true', help='record Vulkan device setup failures')
 parser.add_argument('--use-title-heap', action='store_true', help='use PS5 platform direct-memory title heap')
 args = parser.parse_args()
 if not args.build_id or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._' for c in args.build_id):
@@ -241,6 +242,25 @@ if args.trace_boot:
         assert all(archive_members.count(obj.name) == 1 for obj in objects)
         boot_archives['vendor/dolphin/Source/Core/' + library + '/' + libname] = str(archive)
 
+if args.trace_vulkan:
+    rel = 'vendor/dolphin/Source/Core/VideoBackends/Vulkan'
+    item = source.parent / rel / 'VulkanContext.cpp'
+    target = rel + '/CMakeFiles/videovulkan.dir/VulkanContext.cpp.o'
+    original = host_build / rel / 'libvideovulkan.a'
+    archive = stage / 'libvideovulkan.a'
+    inputs.extend([record(item), record(original)])
+    shutil.copyfile(original, archive)
+    argv = windows_argv(run([ninja, '-t', 'commands', target], host_build).strip().splitlines()[-1])
+    assert Path(argv[0]) == llvm / 'clang++.exe' and Path(argv[argv.index('-c') + 1]) == item
+    obj = stage / 'VulkanContext.cpp.o'
+    for flag, value in [('-o', obj), ('-MF', stage / 'VulkanContext.cpp.d'), ('-MT', obj)]:
+        argv[argv.index(flag) + 1] = str(value)
+    argv[1:1] = ['-DRINGOUT_VULKAN_TRACE=1', '-I', str(source)]
+    run(argv, host_build)
+    run([llvm / 'llvm-ar.exe', 'r', archive, obj])
+    assert run([llvm / 'llvm-ar.exe', 't', archive]).splitlines().count(obj.name) == 1
+    boot_archives[rel + '/libvideovulkan.a'] = str(archive)
+
 fp = work / 'staged-native-r3/fp.o'
 inputs.append(record(fp))
 link = json.loads((work / 'staged-native-r3/link-args.json').read_text())
@@ -298,6 +318,7 @@ receipt = {'build_id': args.build_id, 'source_revision': revision,
            'host_attestation': record(attestation_path) if args.host_build else None,
            'include_ps5_menu': args.include_ps5_menu,
            'trace_boot': args.trace_boot,
+           'trace_vulkan': args.trace_vulkan,
            'use_title_heap': args.use_title_heap,
            'source_state': 'working tree; exact linked source/input hashes below',
            'inputs': inputs, 'tools': [record(llvm / x) for x in ['clang.exe', 'clang++.exe', 'ld.lld.exe', 'llvm-ar.exe']],
