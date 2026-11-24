@@ -51,9 +51,11 @@ readme.write_text('RingOut (dev), development, private local test candidate.\n'
     'Startup logs: startup-0.log through startup-5.log beside eboot.bin, bounded to 64 KiB each.\n'
     'Absolute launch executable paths and absolute game/user arguments are supported; early logs use USB0.\n'
     'Expected test: normal launcher entry, observe startup then real game title/select. No autonomous launch.\n'
-    'Boot, shell exit and relaunch unverified. Xbox/PS2 guest integration remains separate.\n'
+    'Boot, shell exit and relaunch unverified.\n'
+    + ('Spawn and Heihachi are included for testing; selection and gameplay are unverified.\n'
+       if args.guest_dir else 'Xbox/PS2 guest integration remains separate.\n') +
     'POSIX subprocess/symlink/hardlink operations report ENOSYS. pathconf uses kernel descriptor query.\n'
-    'Private baseline copies; do not redistribute.\n')
+    'Private local assets; do not redistribute.\n')
 inventory.extend([{**art(p), 'bytes':p.stat().st_size} for p in [eboot,param,readme]])
 if args.guest_dir:
     guest=pathlib.Path(args.guest_dir).resolve()
@@ -65,7 +67,6 @@ if args.guest_dir:
         except OSError: shutil.copyfile(src,dst)
         if sha(src)!=sha(dst):raise ValueError('guest file changed during packaging: '+src.name)
         inventory.append({**art(dst),'bytes':dst.stat().st_size})
-    readme.write_text(readme.read_text()+'Private guest archive included; both source games remain required for local preparation.\n')
     inventory=[{**art(p),'bytes':p.stat().st_size} if p==readme else item
                for item in inventory for p in [pathlib.Path(item['path'])]]
 (root/'CONTENT.json').write_text(json.dumps({'app_root':str(app),'all_hashes_verified':True,
