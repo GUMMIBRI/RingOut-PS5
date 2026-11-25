@@ -4,11 +4,35 @@
  * require read permission, so this is narrower than POSIX pathconf semantics. */
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 extern long _fpathconf(int, int);
 extern int _fcntl(int, int, ...);
+
+/* The SDK's if_nametoindex first executes a raw socket syscall. Enumerate
+ * the system-provided interface list instead, preserving named IPv6 zones. */
+unsigned int if_nametoindex(const char *name)
+{
+    struct ifaddrs *addresses = NULL;
+    if (!name) { errno = EINVAL; return 0; }
+    if (getifaddrs(&addresses) != 0) return 0;
+    unsigned int index = 0;
+    for (const struct ifaddrs *p = addresses; p; p = p->ifa_next)
+        if (p->ifa_name && p->ifa_addr && p->ifa_addr->sa_family == AF_LINK &&
+            strcmp(p->ifa_name, name) == 0)
+        {
+            index = LLINDEX((const struct sockaddr_dl *)p->ifa_addr);
+            break;
+        }
+    freeifaddrs(addresses);
+    if (!index) errno = ENXIO;
+    return index;
+}
 
 /* Native titles have no terminal. This follows PSXS5's console_curl.c and
  * PS5_PayloadSDK's libc/isatty.c: the WebKit POSIX export can be a null import
