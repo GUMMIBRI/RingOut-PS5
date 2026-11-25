@@ -51,7 +51,10 @@ if args.host_build:
                                    base_revision, revision.stdout.strip()])
         diff = subprocess.run(['git', '-C', str(source_root), 'diff', '--name-only',
                                base_revision, revision.stdout.strip()], capture_output=True, text=True)
-        allowed = {'ModernGekko/ps5/build-native.py',
+        allowed = {'ModernGekko/ps5/build-native.py', 'ModernGekko/ps5/build-package.py',
+                   'ModernGekko/ps5/qualify-native-package.py',
+                   'ModernGekko/ps5/test_build_package_plan.py',
+                   'ModernGekko/ps5/check-vulkan-dispatch.py',
                    'ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp'}
         if not args.trace_vulkan or ancestry.returncode or diff.returncode or not set(diff.stdout.splitlines()) <= allowed:
             parser.error('host archives do not match source; rebuild them before producing a candidate')
