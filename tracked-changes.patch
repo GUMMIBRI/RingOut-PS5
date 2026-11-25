@@ -1504,19 +1504,23 @@ index c262a345..0921456b 100644
  VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceSurfaceSupportKHR, false)
  VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceSurfaceCapabilitiesKHR, false)
 diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp
-index a761a81a..ba0945ad 100644
+index a761a81a..62facb13 100644
 --- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp
 +++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,12 @@
  // Copyright 2016 Dolphin Emulator Project
  // SPDX-License-Identifier: GPL-2.0-or-later
  
 +#include <type_traits>
 +
++#ifdef RINGOUT_VULKAN_TRACE
++#include "native_startup.h"
++#endif
++
  #define VMA_IMPLEMENTATION
  #include "VideoBackends/Vulkan/VulkanLoader.h"
  
-@@ -39,6 +41,10 @@ static void ResetVulkanLibraryFunctionPointers()
+@@ -39,6 +45,10 @@ static void ResetVulkanLibraryFunctionPointers()
  #undef VULKAN_MODULE_ENTRY_POINT
  }
  
@@ -1527,7 +1531,7 @@ index a761a81a..ba0945ad 100644
  static Common::DynamicLibrary s_vulkan_module;
  
  static bool OpenVulkanLibrary(bool force_system_library)
-@@ -92,8 +98,29 @@ static bool OpenVulkanLibrary(bool force_system_library)
+@@ -92,8 +102,29 @@ static bool OpenVulkanLibrary(bool force_system_library)
  #endif
  }
  
@@ -1558,7 +1562,7 @@ index a761a81a..ba0945ad 100644
    if (!s_vulkan_module.IsOpen() && !OpenVulkanLibrary(force_system_library))
      return false;
  
-@@ -107,19 +134,31 @@ bool LoadVulkanLibrary(bool force_system_library)
+@@ -107,19 +138,31 @@ bool LoadVulkanLibrary(bool force_system_library)
    }
  #include "VideoBackends/Vulkan/VulkanEntryPoints.inl"
  #undef VULKAN_MODULE_ENTRY_POINT
@@ -1590,6 +1594,18 @@ index a761a81a..ba0945ad 100644
    bool required_functions_missing = false;
    auto LoadFunction = [&](PFN_vkVoidFunction* func_ptr, const char* name, bool is_required) {
      *func_ptr = vkGetInstanceProcAddr(instance, name);
+@@ -146,6 +189,11 @@ bool LoadVulkanDeviceFunctions(VkDevice device)
+     if (!(*func_ptr) && is_required)
+     {
+       ERROR_LOG_FMT(HOST_GPU, "Vulkan: Failed to load required device function {}", name);
++#ifdef RINGOUT_VULKAN_TRACE
++      ringout_native_stage("vulkan: missing required device function ");
++      ringout_native_stage(name);
++      ringout_native_stage("\n");
++#endif
+       required_functions_missing = true;
+     }
+   };
 diff --git a/dist/RingOut-1.0-dist/module-src/CMakeLists.txt b/dist/RingOut-1.0-dist/module-src/CMakeLists.txt
 index f95f11a6..2416793b 100644
 --- a/dist/RingOut-1.0-dist/module-src/CMakeLists.txt

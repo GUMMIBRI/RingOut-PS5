@@ -38,11 +38,23 @@ if args.host_build:
     if not attestation_path.is_file():
         parser.error('fresh host build requires BUILD-ATTESTATION.json')
     attestation = json.loads(attestation_path.read_text())
+    base_revision = attestation.get('source_revision', '')
     if (attestation.get('status') != 'success' or
-        attestation.get('source_revision') != revision.stdout.strip() or
         Path(attestation.get('source_root', '')).resolve() != source_root.resolve() or
         hashlib.sha256((host_build / 'build.ninja').read_bytes()).hexdigest() != attestation.get('build_ninja_sha256')):
         parser.error('host build attestation does not match source and CMake build')
+    if base_revision != revision.stdout.strip():
+        # The previous attested host can be reused only for this narrowly
+        # bounded Vulkan-loader correction; both Vulkan objects are rebuilt
+        # into a new staged archive below. No tracked headers may differ.
+        ancestry = subprocess.run(['git', '-C', str(source_root), 'merge-base', '--is-ancestor',
+                                   base_revision, revision.stdout.strip()])
+        diff = subprocess.run(['git', '-C', str(source_root), 'diff', '--name-only',
+                               base_revision, revision.stdout.strip()], capture_output=True, text=True)
+        allowed = {'ModernGekko/ps5/build-native.py',
+                   'ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VulkanLoader.cpp'}
+        if not args.trace_vulkan or ancestry.returncode or diff.returncode or not set(diff.stdout.splitlines()) <= allowed:
+            parser.error('host archives do not match source; rebuild them before producing a candidate')
     dirty = subprocess.run(['git', '-C', str(source_root), 'status', '--porcelain', '--untracked-files=no'],
                            capture_output=True, text=True)
     if dirty.returncode or dirty.stdout.strip():
@@ -244,21 +256,23 @@ if args.trace_boot:
 
 if args.trace_vulkan:
     rel = 'vendor/dolphin/Source/Core/VideoBackends/Vulkan'
-    item = source.parent / rel / 'VulkanContext.cpp'
-    target = rel + '/CMakeFiles/videovulkan.dir/VulkanContext.cpp.o'
     original = host_build / rel / 'libvideovulkan.a'
     archive = stage / 'libvideovulkan.a'
-    inputs.extend([record(item), record(original)])
+    inputs.append(record(original))
     shutil.copyfile(original, archive)
-    argv = windows_argv(run([ninja, '-t', 'commands', target], host_build).strip().splitlines()[-1])
-    assert Path(argv[0]) == llvm / 'clang++.exe' and Path(argv[argv.index('-c') + 1]) == item
-    obj = stage / 'VulkanContext.cpp.o'
-    for flag, value in [('-o', obj), ('-MF', stage / 'VulkanContext.cpp.d'), ('-MT', obj)]:
-        argv[argv.index(flag) + 1] = str(value)
-    argv[1:1] = ['-DRINGOUT_VULKAN_TRACE=1', '-I', str(source)]
-    run(argv, host_build)
-    run([llvm / 'llvm-ar.exe', 'r', archive, obj])
-    assert run([llvm / 'llvm-ar.exe', 't', archive]).splitlines().count(obj.name) == 1
+    for name in ('VulkanContext.cpp', 'VulkanLoader.cpp'):
+        item = source.parent / rel / name
+        target = rel + '/CMakeFiles/videovulkan.dir/' + name + '.o'
+        inputs.append(record(item))
+        argv = windows_argv(run([ninja, '-t', 'commands', target], host_build).strip().splitlines()[-1])
+        assert Path(argv[0]) == llvm / 'clang++.exe' and Path(argv[argv.index('-c') + 1]) == item
+        obj = stage / (name + '.o')
+        for flag, value in [('-o', obj), ('-MF', stage / (name + '.d')), ('-MT', obj)]:
+            argv[argv.index(flag) + 1] = str(value)
+        argv[1:1] = ['-DRINGOUT_VULKAN_TRACE=1', '-I', str(source)]
+        run(argv, host_build)
+        run([llvm / 'llvm-ar.exe', 'r', archive, obj])
+        assert run([llvm / 'llvm-ar.exe', 't', archive]).splitlines().count(obj.name) == 1
     boot_archives[rel + '/libvideovulkan.a'] = str(archive)
 
 fp = work / 'staged-native-r3/fp.o'
@@ -284,6 +298,16 @@ link[:0] = ['--defsym=' + name + '=ps5_' + name
 # references do not extract the provider from the static archive; without it,
 # wsi_device_init calls a null GetPhysicalDeviceProperties2 during startup.
 link.insert(0, '--undefined=vk_common_GetPhysicalDeviceProperties2')
+# RADV's generated dispatch tables reference these required providers weakly.
+# A static linker otherwise omits their archive members and vkGetDeviceProcAddr
+# returns null after a successful vkCreateDevice.
+required_device_providers = [
+    'radv_CreateDescriptorPool', 'radv_DestroyDescriptorPool', 'radv_ResetDescriptorPool',
+    'vk_common_CreateFramebuffer', 'vk_common_DestroyFramebuffer',
+    'vk_common_CmdCopyBuffer', 'vk_common_CmdCopyImage', 'vk_common_CmdBlitImage',
+    'vk_common_CmdCopyBufferToImage', 'vk_common_CmdCopyImageToBuffer', 'vk_common_CmdResolveImage',
+]
+link[:0] = ['--undefined=' + symbol for symbol in required_device_providers]
 if args.use_title_heap:
     # Existing PS5 platform archive provides the same synchronized segmented
     # direct-memory allocator used by the working SC2 title. Keep the entire
@@ -302,6 +326,8 @@ for entry in link:
         inputs.append(record(path))
 run([llvm / 'ld.lld.exe', *link], host_build)
 definitions = run([llvm / 'llvm-nm.exe', '--defined-only', stage / 'ringout-native.elf'])
+for symbol in required_device_providers:
+    assert any(line.split()[-1:] == [symbol] for line in definitions.splitlines()), f'missing Vulkan device provider {symbol}'
 assert any(line.split()[-1:] == ['vk_common_GetPhysicalDeviceProperties2']
            for line in definitions.splitlines()), 'RADV physical-device callback is missing'
 if args.use_title_heap:
@@ -316,6 +342,7 @@ revision = run(['git', '-C', source_root, 'rev-parse', 'HEAD']).strip()
 receipt = {'build_id': args.build_id, 'source_revision': revision,
            'host_build': str(host_build),
            'host_attestation': record(attestation_path) if args.host_build else None,
+           'host_base_revision': base_revision if args.host_build else None,
            'include_ps5_menu': args.include_ps5_menu,
            'trace_boot': args.trace_boot,
            'trace_vulkan': args.trace_vulkan,
