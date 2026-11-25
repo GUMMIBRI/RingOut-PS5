@@ -14,7 +14,7 @@ class RecipePlanTest(unittest.TestCase):
     self.assertFalse(stage.exists())
     return
    result=subprocess.run(cmd,capture_output=True,text=True,check=True)
-   plan=json.loads(result.stdout);self.assertFalse(stage.exists());self.assertEqual(len(plan['plan']),5)
+   plan=json.loads(result.stdout);self.assertFalse(stage.exists());self.assertEqual(len(plan['plan']),6)
    self.assertIn('--include-ps5-menu',plan['plan'][0]);self.assertEqual(plan['stage'],str(stage))
    stage.mkdir();(stage/'occupied').write_text('keep')
    bad=subprocess.run(cmd,capture_output=True,text=True)
@@ -55,5 +55,5 @@ class RecipePlanTest(unittest.TestCase):
         '--rollback',str(ROLLBACK),'--host-build',str(pathlib.Path(t)/'host'),
         '--guest-dir',str(pathlib.Path(t)/'guests'),'--asset-source',str(pathlib.Path(t)/'app'),'--trace-vulkan','--dry-run']
    plan=json.loads(subprocess.run(cmd,capture_output=True,text=True,check=True).stdout)['plan']
-   self.assertIn('--host-build',plan[0]);self.assertIn('--trace-vulkan',plan[0]);self.assertIn('--guest-dir',plan[1]);self.assertIn('--asset-source',plan[1])
+   self.assertIn('--host-build',plan[0]);self.assertIn('--trace-vulkan',plan[0]);self.assertIn('check-vulkan-dispatch.py',plan[1][1]);self.assertIn('--guest-dir',plan[2]);self.assertIn('--asset-source',plan[2])
 if __name__=='__main__':unittest.main()

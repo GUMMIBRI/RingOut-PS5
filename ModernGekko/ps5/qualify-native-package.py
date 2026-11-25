@@ -8,11 +8,13 @@ def sha(p):
 def art(p): return {'path':str(p),'sha256':sha(p)}
 def read(name): return json.loads((root/name).read_text(encoding='utf-8-sig'))
 receipt=read('FINALIZATION.json'); imports=read('imports-native.json'); runtime=read('runtime-native.json'); layout=read('layout.json')
+dispatch=read('VULKAN-DISPATCH-CHECK.json')
 native=sha(root/'ringout-native.elf'); elf=sha(root/'eboot.elf'); eboot=sha(root/'eboot.bin')
 assert native==receipt['input_elf']['sha256']==imports['SHA256'].lower()==runtime['SHA256'].lower()
 assert elf==receipt['elf']['sha256']==layout['elf']['sha256'] and native==layout['input_elf']['sha256']
 assert eboot==receipt['eboot']['sha256']==sha(app/'eboot.bin')
 assert runtime['Passed'] and not runtime['InlineSyscalls']
+assert dispatch['status']=='PASS' and dispatch['required_count']>0 and dispatch['elf_sha256']==native
 assert layout['preflight_passed'] and layout['retained_passed']
 assert 'integrity: valid' in receipt['self_inspection']
 assert sha(root/'commands.json')==receipt['commands']['sha256']
@@ -27,7 +29,7 @@ for item in receipt['inputs']:
     shutil.copy2(path,snapshot/path.name)
 audit={'elf':art(root/'eboot.elf'),'eboot':art(root/'eboot.bin'),'input_elf':art(root/'ringout-native.elf'),
        'imports_passed':True,'runtime_layout_passed':True,'self_integrity_passed':True,
-       'raw_reports':[art(root/p) for p in ['imports-native.json','runtime-native.json','layout.json','FINALIZATION.json','commands.json']],
+       'raw_reports':[art(root/p) for p in ['imports-native.json','runtime-native.json','layout.json','VULKAN-DISPATCH-CHECK.json','FINALIZATION.json','commands.json']],
        'scope':'Native named imports mapped by pinned SDK auditor; recorded successful converter maps them to final NIDs. '
                'Converted layout retained sections verified. Signed SELF inspected by pinned tool. '
                'No independent NID-runtime ABI verification or console execution.'}
