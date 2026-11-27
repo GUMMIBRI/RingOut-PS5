@@ -1,0 +1,8 @@
+{
+  global:
+    ringout_prx_exports;
+    module_start;
+    module_stop;
+  local:
+    *;
+};

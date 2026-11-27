@@ -1,0 +1,38 @@
+{
+  "files/bgm.afs": {
+    "bytes": 163776512,
+    "sha256": "3cbe7bfdf7e6cf8b9a27b21b78c4fa541873becdc234d1da3b40690176307909"
+  },
+  "files/movie.afs": {
+    "bytes": 282368000,
+    "sha256": "9fa9b4d94267d0e5f49d63071d38786e27cf7371eae741ce45ba4e5bf4d2eda8"
+  },
+  "files/opening.bnr": {
+    "bytes": 6496,
+    "sha256": "7a0e4e1f08ab6baff8925c4bda7cc68483d5863ae9d889f7ac5ec58f92dd4659"
+  },
+  "files/root.olk": {
+    "bytes": 587427840,
+    "sha256": "2b19f3901dfc1c20596b3d921ee303973592208a2d65594d553cc0751dd57a34"
+  },
+  "sys/apploader.img": {
+    "bytes": 116484,
+    "sha256": "fff1386be75156d3fed0056c2e426ca41ed4a90071adb5212891e05d058cf6bc"
+  },
+  "sys/bi2.bin": {
+    "bytes": 8192,
+    "sha256": "ded648431578c555bc3198d010067fe6af74980019a71efa1df35f74fda2d80e"
+  },
+  "sys/boot.bin": {
+    "bytes": 1088,
+    "sha256": "8d12ac0743d9aeeec5f48660d332441e06e252465f15464ef3eacda3e8329394"
+  },
+  "sys/fst.bin": {
+    "bytes": 99,
+    "sha256": "88d4fa5655f94f301d1bf4ac5f79e82989c7bdd722d75c298be2e4e4fcf15b03"
+  },
+  "sys/main.dol": {
+    "bytes": 2845536,
+    "sha256": "0ad25684426e6e04ee92a1d7919eec08d8d1528af8513472c44dd2eb20ea7ac5"
+  }
+}

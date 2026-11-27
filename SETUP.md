@@ -1,27 +1,26 @@
-# Set up RingOut on USB0
+# Set up RingOut 1.0 Beta
 
-Place the RingOut app folder at `/mnt/usb0/homebrew/PPSA99875/` so `eboot.bin` sits directly inside it. If you already have RingOut installed, back up your `user` folder before updating. It contains your saves and settings.
+RingOut is an unofficial PS5 homebrew port of the US GameCube version of Soulcalibur II. This beta requires your own US GameCube disc image (`GRSEAF`) and one Windows PC preparation step.
 
-On Windows, extract the PC data-prep kit. Install Python 3.11 or later and open PowerShell in the folder containing `prepare-ringout.py`. Use your own US GameCube disc image (`GRSEAF`) and substitute your paths in the commands below. Link is included with the GameCube roster.
+1. Extract the PS5 ZIP to the USB drive's `homebrew` folder. On the PS5, the executable should be at `/mnt/usb0/homebrew/PPSA99875/eboot.bin`. Keep the included `sys`, `sce_sys` and `sce_module/libc.prx` in place.
+2. Extract the separate **Windows Setup Kit** on your PC. Install Python 3.11 or newer, CMake, Ninja, Windows LLVM, and the public PS5 SDK v0.45. If you want Spawn or Heihachi, install Zig as well. Either add CMake, Ninja and Zig to PATH or supply their executable paths to the setup script.
+3. Put any optional Soulcalibur II Xbox ISO/XISO and US PS2 ISO beside your GameCube ISO. The setup detects one supported donor of each kind in that folder. Use `--spawn` or `--heihachi` to select a specific ISO or extracted disc folder. Use `--stock` for the GameCube roster only. Link comes with the GameCube roster.
 
-```powershell
-py -3 prepare-ringout.py prepare "D:\Discs\Soulcalibur II USA GameCube.iso" --output "D:\RingOutData"
-```
-
-To include Heihachi and Spawn, use the following command for the preparation step. Supply your own US PS2 disc image, extracted Xbox game folder and Zig compiler. The Xbox folder needs `root.olk` and the game executable.
+Open PowerShell in the Windows Setup Kit and run this command with your own paths. Use a new output folder.
 
 ```powershell
-py -3 prepare-ringout.py prepare "D:\Discs\Soulcalibur II USA GameCube.iso" --output "D:\RingOutData" --heihachi "D:\Discs\Soulcalibur II USA PS2.iso" --spawn "D:\Discs\Soulcalibur II Xbox" --cc "C:\Tools\zig\zig.exe"
+py -3 setup-ringout.py "D:\Discs\Soulcalibur II USA GameCube.iso" --output "D:\RingOutData" --sdk "D:\Tools\ps5-payload-sdk" --llvm "C:\Program Files\LLVM\bin"
 ```
 
-Check the prepared files before copying them.
+After the script prints **Ready to copy**, copy these files while RingOut is closed.
 
-```powershell
-py -3 prepare-ringout.py check "D:\RingOutData\game"
-```
+| Windows output | PS5 destination |
+| --- | --- |
+| `D:\RingOutData\game` | `/mnt/usb0/homebrew/PPSA99875/game/` |
+| `D:\RingOutData\sce_module\gGRSEAF_recomp.prx` | `/mnt/usb0/homebrew/PPSA99875/sce_module/gGRSEAF_recomp.prx` |
 
-With RingOut closed, copy the prepared `game` folder beside `eboot.bin`. The optional fighters use `game/guests/root-guests.olk` and `game/guests/guests.json`. Keep your original disc images on your PC. Leave your existing `user/GC/USA/Card A/` folder in place to keep your saves.
+Leave the existing `user/` folder in place. Your GameCube saves are under `user/GC/USA/Card A/`. After setup, the prepared game files and the player-generated PRX are all the console needs. Spawn and Heihachi are stored in `game/guests/root-guests.olk` and `game/guests/guests.json`. Keep both files together. You can remove the Xbox and PS2 ISO copies from your working folder after you verify the fighters in-game.
 
-For optional HD textures, place each compatible mod in its own folder under `user/Load/Mods/`. Launch RingOut, press **L3 + R3**, open **Mods**, and use **Cross** to enable **HD texture pack** and each pack you want. Turn the master switch off to restore the original textures.
+For optional HD textures, put each compatible pack in its own folder in `/mnt/usb0/homebrew/PPSA99875/user/Load/Mods/`. In-game, press **L3 + R3**, open **Mods**, and enable **HD texture pack** and the pack you want. Turn off **HD texture pack** to restore the original textures.
 
 Thanks to xensavage for all of the help.
