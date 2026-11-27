@@ -1,0 +1,234 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/RecompGuest.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/RecompGuest.cpp
+index adc67e21..d583e83b 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/RecompGuest.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/RecompGuest.cpp
+@@ -17,6 +17,7 @@
+ #include "Core/RecompGuestTables.h"
+ #include "Core/System.h"
+ #include "DiscIO/DirectoryBlob.h"
++#include "VideoCommon/RecompOlk.h"
+ 
+ namespace RecompGuest
+ {
+@@ -37,6 +38,10 @@ int s_force_id = 0;                                   // RINGOUT_SPAWN_FORCE_ID,
+ // P1's character when the select screen is skipped (the arcade route's default, 800AE8CC writes 22).
+ constexpr std::uint32_t kP1DefaultCharacter = 0x8034D550;
+ 
++// GRSEAF loads group 2 record 5 into a fixed 0xA0000-byte common-data arena.
++// Keep one 0x800-byte DVD sector clear, as in the converter's capacity check.
++constexpr std::uint32_t kCommonPackMax = 0x9f800;
++
+ std::string ReadAll(const std::string& path)
+ {
+   std::ifstream f(path, std::ios::binary);
+@@ -87,12 +92,24 @@ void Initialize(const std::string& game_root, const std::string& root_sha1)
+   }
+   else
+   {
+-    s_hash = m.guests_sha1;
+-    s_patches = RecompGuestTables::MakeUsPatches(m);
+-    s_installed = RecompGuestTables::InstalledFrom(m);
+-    s_unavailable.clear();
+-    std::fprintf(stderr, "[guests] available (%.12s):%s%s\n", s_hash.c_str(), s_installed.spawn ? " Spawn" : "",
+-                 s_installed.heihachi ? " Heihachi" : "");
++    const auto common_pack = RecompOlk::FindGroupEntry(archive, size, 2, 5);
++    // The limit is a whole number of sectors, so a length at or below it
++    // also fits after the game's DVD alignment.
++    if (!common_pack.found || common_pack.size == 0 || common_pack.size > kCommonPackMax)
++    {
++      s_unavailable = "guest common data does not fit the game buffer (rebuild guests)";
++      std::fprintf(stderr, "[guests] unavailable: %s, record size=0x%x\n", s_unavailable.c_str(),
++                   common_pack.size);
++    }
++    else
++    {
++      s_hash = m.guests_sha1;
++      s_patches = RecompGuestTables::MakeUsPatches(m);
++      s_installed = RecompGuestTables::InstalledFrom(m);
++      s_unavailable.clear();
++      std::fprintf(stderr, "[guests] available (%.12s):%s%s\n", s_hash.c_str(),
++                   s_installed.spawn ? " Spawn" : "", s_installed.heihachi ? " Heihachi" : "");
++    }
+   }
+   DiscIO::SetHostFileResolver(&ResolveHostFile);
+ }
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompOlk.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompOlk.cpp
+index 0b869c00..79418673 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompOlk.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompOlk.cpp
+@@ -13,6 +13,8 @@ namespace
+ {
+ constexpr std::uint64_t kHeaderSize = 2048;
+ constexpr std::uint32_t kMagic = 0x6b6e6c6f;  // "olnk"
++constexpr std::uint32_t kIndexHeaderSize = 32;
++constexpr std::uint32_t kIndexRecordSize = 16;
+ 
+ std::uint32_t ReadLE32(const unsigned char* p)
+ {
+@@ -53,6 +55,44 @@ std::vector<std::pair<std::uint32_t, std::uint32_t>> ReadIndex(std::ifstream& fi
+ }
+ }  // namespace
+ 
++Slot FindGroupEntry(const std::string& root_olk, std::uint64_t file_size,
++                    std::uint32_t group, std::uint32_t entry)
++{
++  std::ifstream file(root_olk, std::ios::binary);
++  if (!file)
++    return {};
++
++  const auto read_entry = [&file](std::uint64_t start, std::uint64_t size,
++                                  std::uint32_t index) -> Slot {
++    unsigned char header[kIndexHeaderSize];
++    if (size < sizeof(header))
++      return {};
++    file.seekg(static_cast<std::streamoff>(start));
++    file.read(reinterpret_cast<char*>(header), sizeof(header));
++    if (!file || ReadLE32(header + 4) != kMagic || index >= ReadLE32(header))
++      return {};
++
++    const std::uint32_t data = ReadLE32(header + 16);
++    const std::uint64_t record = sizeof(header) + std::uint64_t(index) * kIndexRecordSize;
++    if (data > size || record + kIndexRecordSize > data)
++      return {};
++
++    unsigned char fields[kIndexRecordSize];
++    file.seekg(static_cast<std::streamoff>(start + record));
++    file.read(reinterpret_cast<char*>(fields), sizeof(fields));
++    if (!file)
++      return {};
++    const std::uint64_t offset = std::uint64_t(data) + ReadLE32(fields);
++    const std::uint32_t length = ReadLE32(fields + 4);
++    if (offset > size || length > size - offset)
++      return {};
++    return {true, start + offset, length};
++  };
++
++  const Slot container = read_entry(0, file_size, group);
++  return container.found ? read_entry(container.offset, container.size, entry) : Slot{};
++}
++
+ Slot FindUniqueSlotBySize(const std::string& root_olk, std::uint32_t size)
+ {
+   Slot result;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompOlk.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompOlk.h
+index 905d9e9f..240f1f00 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompOlk.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompOlk.h
+@@ -34,6 +34,10 @@ struct Slot
+ // worse than declining to place it.
+ Slot FindUniqueSlotBySize(const std::string& root_olk, std::uint32_t size);
+ 
++// Locate an explicitly numbered entry, requiring that it fits its containing group.
++Slot FindGroupEntry(const std::string& root_olk, std::uint64_t file_size,
++                    std::uint32_t group, std::uint32_t entry);
++
+ // Do the bytes at that slot already equal the file's contents?
+ bool SlotMatchesFile(const std::string& root_olk, const Slot& slot, const std::string& path);
+ }  // namespace RecompOlk
+diff --git a/tools/guests/build_guests.py b/tools/guests/build_guests.py
+index c2d18b27..1dca0184 100644
+--- a/tools/guests/build_guests.py
++++ b/tools/guests/build_guests.py
+@@ -66,14 +66,14 @@ def build(guests, gc, out_dir, dol):
+                 scenes[r] = e
+         appended, faces, sils, camera, group2, rows = [], g.entry(*ui.FACE_ENTRY), g.entry(*ui.SILHOUETTE_ENTRY), \
+             g.entry(*ui.PROFILE_CAMERA), {}, []
+-        for k, s in enumerate(guests):
++        faces, face_indices = ui.guest_face_bank(faces, [s.faces for s in guests])
++        for k, (s, indices) in enumerate(zip(guests, face_indices, strict=True)):
+             art_at = ui.ENDING_ART_BASE + s.id
+             if g.entry(2, art_at): raise ValueError('group 2 record %d is not empty on this disc' % art_at)
+             group2[art_at] = s.ending_art
+-            faces, first = ui.append_textures(faces, ui.FACE_PART, s.faces)
+             sils, sfirst = ui.append_textures(sils, ui.SILHOUETTE_PART, s.silhouettes)
+             camera = s.camera(camera)
+-            cell = tables.cell_with_faces(s.tables['cell'], range(first, first + len(s.faces)))
++            cell = tables.cell_with_faces(s.tables['cell'], indices)
+             cell = tables.cell_with_silhouettes(cell, range(sfirst, sfirst + len(s.silhouettes)), s.tables['xcell'])
+             appended += [s.block.get(i, b'') for i in range(BLOCK_RECORDS)]
+             rows.append(_rows(s, GC_FIRST_RECORD + k * BLOCK_RECORDS, cell))
+diff --git a/tools/guests/tests/test_build_guests.py b/tools/guests/tests/test_build_guests.py
+index b0814b60..07a1c90c 100644
+--- a/tools/guests/tests/test_build_guests.py
++++ b/tools/guests/tests/test_build_guests.py
+@@ -57,9 +57,12 @@ class TwoGuests(unittest.TestCase):
+ 
+     def test_faces_and_silhouettes_follow_in_order(self):
+         cells = [bytes.fromhex(g['cell']) for g in self.m['guests']]
+-        self.assertEqual((list(cells[0][8:10]), list(cells[1][8:10])), ([77, 78], [79, 80]))
++        self.assertEqual((list(cells[0][8:10]), list(cells[1][8:10])), ([77, 77], [78, 78]))
++        self.assertEqual(list(bytes.fromhex(self.m1['guests'][0]['cell'])[8:10]), [77, 78])
+         self.assertEqual((list(cells[0][16:18]), list(cells[1][16:18])), ([150, 151], [152, 153]))
+-        self.assertEqual(ui.decode_face(self.a.entry(*ui.FACE_ENTRY), 79), ui.decode_face(self.a.entry(*ui.FACE_ENTRY), 77))
++        packed = self.a.entry(*ui.FACE_ENTRY)
++        self.assertLessEqual((len(packed) + 0x7ff) & ~0x7ff, 0x9f800)
++        self.assertEqual(ui.decode_face(packed, 78), ui.decode_face(packed, 77))
+ 
+     def test_hash_depends_on_the_guests(self):
+         self.assertEqual(len(self.m['guests_sha1']), 40)
+diff --git a/tools/guests/ui.py b/tools/guests/ui.py
+index 9c78a942..5c479916 100644
+--- a/tools/guests/ui.py
++++ b/tools/guests/ui.py
+@@ -177,7 +177,45 @@ def face_bank(xbox_entry, gc_entry, faces=XB_SPAWN_FACES):
+     return out, n
+ 
+ 
+-def append_textures(gc_entry, part, items):
++# The game carves 0xA0000 bytes for this common menu and mission pack before the
++# next arena. Its DVD loader rounds the read to a 0x800-byte sector.
++_COMMON_PACK_CAPACITY = 0xA0000
++_DVD_SECTOR_SIZE = 0x800
++
++
++def guest_face_bank(gc_entry, guest_faces):
++    """Return the shared face pack and the portrait index for every guest costume."""
++    if any(not faces for faces in guest_faces):
++        raise ValueError('every guest needs at least one portrait')
++
++    def build(primary_only):
++        items, indices = [], []
++        for faces in guest_faces:
++            index = len(items)
++            if primary_only:
++                items.append(faces[0])
++                indices.append([index] * len(faces))
++            else:
++                items.extend(faces)
++                indices.append(range(index, len(items)))
++        # The stock common pack aligns its inner parts to 0x80. The outer OLK
++        # writer supplies the separate DVD sector alignment.
++        entry, first = append_textures(gc_entry, FACE_PART, items, part_alignment=0x80)
++        return entry, [[first + index for index in row] for row in indices]
++
++    def fits(entry):
++        rounded = len(entry) + (-len(entry) % _DVD_SECTOR_SIZE)
++        return rounded <= _COMMON_PACK_CAPACITY - _DVD_SECTOR_SIZE
++
++    entry, indices = build(primary_only=False)
++    if not fits(entry):
++        entry, indices = build(primary_only=True)
++        if not fits(entry):
++            raise ValueError('guest portraits exceed the common game-data buffer')
++    return entry, indices
++
++
++def append_textures(gc_entry, part, items, *, part_alignment=0x800):
+     """Append textures to the VGT bank in pack part `part` of a GC entry. Each item is (template record
+     words, pixel bytes, GR palette half, AB palette half, palette entries); the template gives format and
+     size. Returns (new entry, index of the first new texture).
+@@ -228,10 +266,11 @@ def append_textures(gc_entry, part, items):
+     for k, w in enumerate(recs): struct.pack_into('>17I', vgt, table + _REC * k, *w)
+     struct.pack_into('>I', vgt, 8, len(recs)); struct.pack_into('>I', vgt, 0x14, new_end + _DESC * len(recs))
+     vgt.extend(bytes(-len(vgt) % 32))
+-    # Re-pack, keeping the original header size and each later part's alignment (the growth is padded to
+-    # a multiple of 0x800, the largest alignment any part offset has).
++    # Preserve the packed header and pad the growth to the required inner-part alignment.
+     offs = struct.unpack_from('>%dI' % (len(gparts) + 1), gc_entry, 4)
+-    grow = len(vgt) - len(old); grow += -grow % 0x800
++    if part_alignment != 0x800 and any(offset % part_alignment for offset in offs):
++        raise ValueError('unexpected inner-part alignment in the source pack')
++    grow = len(vgt) - len(old); grow += -grow % part_alignment
+     vgt.extend(bytes(grow - (len(vgt) - len(old))))
+     new_offs = [o + (grow if i > part else 0) for i, o in enumerate(offs)]
+     out = bytearray(gc_entry[:offs[0]])
